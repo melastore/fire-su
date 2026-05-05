@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+	<title>fire-su</title>
+	<script type="module" crossorigin src="/assets/index-GcPgfSQW.js"></script>
+	<link rel="stylesheet" crossorigin href="/assets/index-CDUKYGa9.css">
+</head>
+<body>
+	<main class="app-shell">
+		<header class="app-header">
+			<section class="brand">
+				<div class="mark">✓</div>
+				<div>
+					<h1>fire-su</h1>
+					<p id="status" class="status">Loading firewall state</p>
+				</div>
+			</section>
+			<section class="header-actions" aria-label="Primary actions">
+				<button id="refresh" class="tool-button" type="button" aria-label="Refresh" title="Refresh">↻</button>
+				<button id="apply" class="tool-button primary" type="button" aria-label="Apply" title="Apply">✓</button>
+				<button id="settings-toggle" class="tool-button" type="button" aria-label="Menu" aria-expanded="false" title="Menu">⋮</button>
+			</section>
+		</header>
+
+		<section id="settings-panel" class="settings-panel" aria-label="Actions" hidden>
+			<div class="menu-row">
+				<button id="bulk-allow" class="menu-action" type="button"><span>Allow shown</span><strong></strong></button>
+				<button id="bulk-block" class="menu-action is-selected" type="button"><span>Block shown</span><strong></strong></button>
+			</div>
+			<div class="mode-panel">
+				<span class="control-label">Policy</span>
+				<div class="segmented" role="group" aria-label="Default policy">
+					<button class="mode is-active" type="button" data-mode="blacklist">Blacklist</button>
+					<button class="mode" type="button" data-mode="whitelist">Whitelist</button>
+				</div>
+			</div>
+			<div class="mode-panel">
+				<span class="control-label">Profile</span>
+				<div class="segmented" role="group" aria-label="Android profile">
+					<button class="profile is-active" type="button" data-profile="owner">Owner</button>
+					<button class="profile" type="button" data-profile="private">Work</button>
+					<button class="profile" type="button" data-profile="all">All</button>
+				</div>
+			</div>
+			<label class="system-toggle">
+				<span>System apps</span>
+				<input id="show-system" type="checkbox">
+			</label>
+			<div class="profile-tools">
+				<label for="profile-name">Profile name</label>
+				<input id="profile-name" type="text" inputmode="latin" autocomplete="off" placeholder="daily">
+				<button id="profile-save" class="tool-button quiet" type="button">Save</button>
+				<button id="profile-apply" class="tool-button quiet" type="button">Apply</button>
+			</div>
+		</section>
+
+		<section class="summary-grid" aria-label="Summary">
+			<div class="summary-item">
+				<strong id="total-count">0</strong>
+				<span>shown</span>
+			</div>
+			<div class="summary-item">
+				<strong id="blocked-count">0</strong>
+				<span>restricted</span>
+			</div>
+			<div class="summary-item">
+				<strong id="active-count">0</strong>
+				<span>pending</span>
+			</div>
+			<div class="summary-item">
+				<strong id="blocked-packets">0</strong>
+				<span>drops</span>
+			</div>
+		</section>
+
+		<nav class="view-tabs" aria-label="Views">
+			<button class="view-tab is-active" type="button" data-view="rules">Rules</button>
+			<button class="view-tab" type="button" data-view="activity">Activity</button>
+			<button class="view-tab" type="button" data-view="health">Health</button>
+		</nav>
+
+		<section id="rules-view" class="view-panel">
+			<div class="toolbar" aria-label="Filters">
+				<input id="search" type="search" autocomplete="off" spellcheck="false" placeholder="Search apps, UID, user">
+				<div class="filters" role="group" aria-label="Rule filters">
+					<button class="filter is-active" type="button" data-filter="all">All</button>
+					<button class="filter" type="button" data-filter="blocked">Blocked</button>
+					<button class="filter" type="button" data-filter="wifi">Wi-Fi</button>
+					<button class="filter" type="button" data-filter="mobile">Mobile</button>
+					<button class="filter" type="button" data-filter="vpn">VPN</button>
+					<button class="filter" type="button" data-filter="lan">LAN</button>
+				</div>
+			</div>
+
+			<div class="rules-header" aria-hidden="true">
+				<span></span>
+				<span class="column-header" data-scope="wifi">Wi-Fi</span>
+				<span class="column-header" data-scope="mobile">Mob</span>
+				<span class="column-header" data-scope="vpn">VPN</span>
+				<span class="column-header" data-scope="lan">LAN</span>
+				<span>Application</span>
+			</div>
+			<section id="apps-list" class="rules-list" aria-live="polite"></section>
+			<div id="empty" class="empty-state" hidden>No packages match the current filter.</div>
+		</section>
+
+		<section id="activity-view" class="view-panel" hidden>
+			<div class="activity-layout">
+				<section class="data-panel">
+					<header>
+						<h2>Traffic counters</h2>
+						<span id="stats-count">0</span>
+					</header>
+					<div id="stats-list" class="metric-list"></div>
+				</section>
+				<section class="data-panel">
+					<header>
+						<h2>Recent decisions</h2>
+						<span id="logs-count">0</span>
+					</header>
+					<div id="logs-list" class="metric-list"></div>
+				</section>
+			</div>
+		</section>
+
+		<section id="health-view" class="view-panel" hidden>
+			<section class="data-panel">
+				<header>
+					<h2>Runtime health</h2>
+					<span id="health-state">check</span>
+				</header>
+				<div id="doctor-list" class="metric-list"></div>
+			</section>
+		</section>
+	</main>
+</body>
+</html>
