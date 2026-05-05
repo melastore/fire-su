@@ -29,6 +29,13 @@
 				<button id="bulk-allow" class="menu-action" type="button"><span>Allow shown</span><strong></strong></button>
 				<button id="bulk-block" class="menu-action is-selected" type="button"><span>Block shown</span><strong></strong></button>
 			</div>
+			<div class="template-tools">
+				<span class="control-label">Templates</span>
+				<button class="template-action" type="button" data-template="offline">Offline</button>
+				<button class="template-action" type="button" data-template="wifi-only">Wi-Fi only</button>
+				<button class="template-action" type="button" data-template="mobile-off">No mobile</button>
+				<button class="template-action" type="button" data-template="lan-open">LAN open</button>
+			</div>
 			<div class="mode-panel">
 				<span class="control-label">Policy</span>
 				<div class="segmented" role="group" aria-label="Default policy">
@@ -48,11 +55,36 @@
 				<span>System apps</span>
 				<input id="show-system" type="checkbox">
 			</label>
+			<div class="group-tools">
+				<span class="control-label">Groups</span>
+				<select id="group-filter" aria-label="Group filter">
+					<option value="all">All groups</option>
+					<option value="ungrouped">Ungrouped</option>
+				</select>
+				<input id="group-name" type="text" inputmode="latin" autocomplete="off" placeholder="group name">
+			</div>
+			<div class="backup-tools">
+				<span class="control-label">Backup</span>
+				<textarea id="backup-data" rows="4" spellcheck="false" placeholder="Export or paste profile JSON"></textarea>
+				<div>
+					<button id="backup-export" class="tool-button quiet" type="button">Export</button>
+					<button id="backup-import" class="tool-button quiet" type="button">Import</button>
+				</div>
+			</div>
 			<div class="profile-tools">
 				<label for="profile-name">Profile name</label>
 				<input id="profile-name" type="text" inputmode="latin" autocomplete="off" placeholder="daily">
 				<button id="profile-save" class="tool-button quiet" type="button">Save</button>
 				<button id="profile-apply" class="tool-button quiet" type="button">Apply</button>
+			</div>
+		</section>
+
+		<section id="first-run" class="first-run" hidden>
+			<strong>Choose a starting point</strong>
+			<p>Blacklist is safer for first use. Whitelist blocks apps unless rules allow them.</p>
+			<div>
+				<button id="first-blacklist" class="tool-button quiet" type="button">Blacklist</button>
+				<button id="first-whitelist" class="tool-button quiet" type="button">Whitelist</button>
 			</div>
 		</section>
 

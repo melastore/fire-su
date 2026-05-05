@@ -204,6 +204,12 @@ impl RuleBits {
             "vpn" => self.vpn = value,
             "lan" => self.lan = value,
             "dns" => self.dns = value,
+            "visible" | "networks" => {
+                self.wifi = value;
+                self.mobile = value;
+                self.vpn = value;
+                self.lan = value;
+            }
             "all" => {
                 self.internet = value;
                 self.wifi = value;
