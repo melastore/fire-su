@@ -1,37 +1,103 @@
 # fire-su
 
-`fire-su` is a rooted Android network firewall built around a Rust userspace daemon and cgroup eBPF filters. It ships as a Magisk/KernelSU/APatch style module with a small WebUI for managing per-app rules.
+**fire-su** is a root firewall for Android that blocks app traffic with cgroup eBPF instead of a VPN service.
 
-The project is meant for devices where Android's normal VPN-based firewall approach is not ideal. Rules are applied below the app layer, so the firewall can block traffic without holding a VPN slot.
+It is built for people who want a fast per-app firewall without giving up Android's VPN slot. Flash the module, open the WebUI, pick an app, and decide where it is allowed to connect: Wi-Fi, mobile data, VPN, LAN, or nowhere.
 
-## What It Does
+## Why Use It
 
-- Blocks or allows apps by Android package and user profile.
-- Supports blacklist and whitelist modes.
-- Applies scoped rules for internet, Wi-Fi, mobile data, VPN, LAN, and DNS.
-- Tracks traffic counters and recent blocked events from eBPF maps.
-- Provides temporary rules, saved profiles, and a local WebUI.
-- Falls back between several eBPF program variants for devices with stricter verifier limits.
+- No always-on VPN firewall service.
+- Per-app rules for the owner profile and work/private profiles.
+- Quick templates like Offline, Wi-Fi only, No mobile, and LAN open.
+- Blacklist mode for normal use and whitelist mode for stricter setups.
+- Temporary rules when you only want to block something for a short time.
+- Saved profiles for switching between daily, travel, work, or lockdown setups.
+- Traffic counters and recent firewall decisions from the eBPF layer.
+- Small module package: the release artifact is just `fire-su.zip`.
+
+## How It Works
+
+Android gives every app a Linux UID. `fire-su` reads the installed app list, stores your rules in `/data/adb/fire-su`, and loads an eBPF program on the device cgroup. When an app opens a network connection, the eBPF program checks that UID and the outgoing network type.
+
+The result is simple:
+
+```text
+app UID + network type -> allow or block
+```
+
+The daemon keeps the eBPF maps synced with your WebUI changes. If a device kernel rejects the most advanced eBPF program, `fire-su` automatically tries smaller fallback programs so more devices can still run basic blocking.
+
+Note: older builds had a DNS rule field. The latest WebUI does not expose DNS as a separate control; rules are focused on internet, Wi-Fi, mobile data, VPN, and LAN.
 
 ## Install
 
-Use the release module in this repository:
+Download or build:
 
-```sh
+```text
 fire-su.zip
 ```
 
-Flash it from Magisk, KernelSU, APatch, MMRL, or another compatible module manager, then reboot. Open the module action to launch the WebUI through KSU WebUI Standalone or MMRL.
+Flash it with Magisk, KernelSU, APatch, MMRL, or another compatible module manager, then reboot.
 
-Device requirements:
+Open the module action to launch the WebUI. It works with KSU WebUI Standalone or MMRL WebUI.
+
+## Requirements
 
 - Root with module support.
 - Android kernel with cgroup eBPF support.
-- A writable `/data/adb` module environment.
+- `/data/adb` module environment.
+- KSU WebUI Standalone or MMRL if you want the graphical interface.
+
+## WebUI
+
+The WebUI is the main way to use `fire-su`.
+
+You can:
+
+- Search installed apps.
+- Filter owner, work/private, or all profiles.
+- Switch between blacklist and whitelist mode.
+- Toggle Wi-Fi, mobile, VPN, and LAN per app.
+- Apply bulk templates to many apps.
+- Save and apply named profiles.
+- Export/import rule data.
+- View traffic counters and recent blocked decisions.
+
+## CLI
+
+The module starts the daemon at boot, but the binary can also be used directly:
+
+```sh
+fire-su status
+fire-su list-apps
+fire-su mode blacklist
+fire-su set com.example.app@0 mobile 1
+fire-su set com.example.app@0 wifi 0
+fire-su temp-set com.example.app@0 visible 1 900
+fire-su profile-save daily
+fire-su apply
+fire-su disable
+```
+
+Rule values use `1` for blocked and `0` for allowed.
+
+Common scopes:
+
+```text
+internet
+wifi
+mobile
+vpn
+lan
+visible
+all
+```
+
+`visible` means Wi-Fi, mobile, VPN, and LAN together. It is useful for simple temporary blocks from the WebUI.
 
 ## Build
 
-Install Rust, the Android NDK, and `bpf-linker` first:
+Install Rust, the Android NDK, and `bpf-linker`:
 
 ```sh
 rustup toolchain install stable
@@ -39,47 +105,42 @@ rustup toolchain install nightly --component rust-src
 cargo install bpf-linker
 ```
 
-Put the Android NDK LLVM tools on `PATH`, then build the Android binary:
+Put the Android NDK LLVM tools on `PATH`, then build:
 
 ```sh
 ./build-android.sh
 ```
 
-Package the module zip:
+Package the module:
 
 ```sh
 ./package-release.sh
 ```
 
-The packaging command writes `fire-su.zip` at the repository root. That zip is the only release artifact intentionally kept in Git.
+The script creates `fire-su.zip` at the repository root.
 
-## Repository Layout
+## Project Layout
 
 ```text
-fire-su-v3/backend/fire-su/   Rust workspace for userspace and eBPF code
+fire-su-v3/backend/fire-su/   Rust userspace daemon and eBPF workspace
 system/bin/fire-su            Android module binary
-webroot/                      WebUI bundle used by module managers
+webroot/                      WebUI bundle
 META-INF/                     Flashable module compatibility files
-customize.sh                  Install-time module setup
+customize.sh                  Install-time setup
 service.sh                    Boot-time daemon launcher
-action.sh                     WebUI launcher action
+action.sh                     WebUI launcher
 uninstall.sh                  Cleanup hook
+fire-su.zip                   Flashable release package
 ```
 
-## CLI Notes
+## Status
 
-The module normally starts the daemon at boot, but the binary also exposes direct commands:
+This project is still low-level Android firewall software. Test on your own device carefully, keep a way to disable modules from recovery, and report device-specific kernel issues with logs from:
 
 ```sh
-fire-su status
-fire-su list-apps
-fire-su mode whitelist
-fire-su set com.example.app@0 internet 1
-fire-su apply
-fire-su disable
+fire-su doctor
+fire-su logs
 ```
-
-Rules are stored under `/data/adb/fire-su`, so module upgrades keep the firewall configuration unless the module is uninstalled.
 
 ## License
 
