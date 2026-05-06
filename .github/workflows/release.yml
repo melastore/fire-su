@@ -1,0 +1,99 @@
+name: Manual Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v1.2.0"
+        required: true
+        type: string
+      release_name:
+        description: "Release title. Leave empty to use the tag."
+        required: false
+        type: string
+      rebuild_android_binary:
+        description: "Rebuild the aarch64 Android binary before packaging"
+        required: true
+        default: false
+        type: boolean
+      prerelease:
+        description: "Mark this release as a pre-release"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install packaging tools
+        run: sudo apt-get update && sudo apt-get install -y zip unzip
+
+      - name: Install Rust toolchains
+        if: ${{ inputs.rebuild_android_binary }}
+        run: |
+          rustup toolchain install stable
+          rustup toolchain install nightly --component rust-src
+          rustup target add aarch64-linux-android
+
+      - name: Install eBPF linker
+        if: ${{ inputs.rebuild_android_binary }}
+        run: cargo install bpf-linker --locked
+
+      - name: Build Android binary
+        if: ${{ inputs.rebuild_android_binary }}
+        run: |
+          export PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+          ./build-android.sh
+          cp dist/android/fire-su-aarch64-linux-android system/bin/fire-su
+          chmod 0755 system/bin/fire-su
+
+      - name: Package module
+        run: ./package-release.sh
+
+      - name: Validate package
+        run: |
+          unzip -t fire-su.zip
+          sha256sum fire-su.zip > fire-su.zip.sha256
+
+      - name: Prepare release notes
+        run: |
+          release_name="${{ inputs.release_name }}"
+          [ -n "$release_name" ] || release_name="${{ inputs.tag }}"
+          version="$(grep '^version=' module.prop | cut -d= -f2-)"
+          version_code="$(grep '^versionCode=' module.prop | cut -d= -f2-)"
+          {
+            echo "# $release_name"
+            echo
+            echo "Flashable module package for fire-su."
+            echo
+            echo "- Module version: $version"
+            echo "- Version code: $version_code"
+            echo "- Commit: $GITHUB_SHA"
+            echo
+            echo "## Install"
+            echo
+            echo "Flash \`fire-su.zip\` with Magisk, KernelSU, APatch, MMRL, or another compatible module manager, then reboot."
+            echo
+            echo "## Checksum"
+            echo
+            cat fire-su.zip.sha256
+          } > release-notes.md
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.release_name || inputs.tag }}
+          body_path: release-notes.md
+          prerelease: ${{ inputs.prerelease }}
+          files: |
+            fire-su.zip
+            fire-su.zip.sha256
