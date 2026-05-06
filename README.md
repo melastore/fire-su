@@ -144,4 +144,6 @@ fire-su logs
 
 ## License
 
-Userspace code is licensed under MIT or Apache-2.0. eBPF code is licensed under MIT or GPL-2.0. See the license files in `fire-su-v3/backend/fire-su/` for the exact terms.
+This project is released under the MIT License.
+
+That means anyone can use it, copy it, modify it, publish it, fork it, distribute it, or build their own project from it, including commercial projects. The only requirement is keeping the license notice with the code.

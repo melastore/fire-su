@@ -8,7 +8,7 @@ members = [
 default-members = ["fire-su", "fire-su-common"]
 
 [workspace.package]
-license = "MIT OR Apache-2.0"
+license = "MIT"
 edition = "2024"
 
 [workspace.dependencies]
