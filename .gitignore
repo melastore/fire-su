@@ -1,7 +1,9 @@
 .git-root/
 .git-nested-backup/
+.git-empty-placeholder/
 .agents/
 .codex/
+README.sdr/
 
 # Rust build output
 target/
