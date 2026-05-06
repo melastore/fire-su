@@ -1,2 +1,18 @@
 .git-root/
 .git-nested-backup/
+.agents/
+.codex/
+
+# Rust build output
+target/
+debug/
+**/*.rs.bk
+
+# Local Android build output. Keep the published module zip only.
+dist/
+*.zip
+!fire-su.zip
+
+# Editor and OS noise
+.DS_Store
+*.swp

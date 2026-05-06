@@ -71,6 +71,37 @@ textarea:disabled {
 	box-shadow: 0 2px 8px rgba(0, 0, 0, .34);
 }
 
+.apply-progress {
+	position: absolute;
+	left: 0;
+	right: 0;
+	bottom: -22px;
+	display: grid;
+	gap: 2px;
+	padding: 0 12px;
+	background: rgba(18, 86, 20, .96);
+	color: #e8ffe8;
+	font-size: .68rem;
+}
+
+.apply-progress[hidden] {
+	display: none;
+}
+
+#apply-progress-bar {
+	width: 0;
+	height: 3px;
+	border-radius: 999px;
+	background: #f5fff5;
+	transition: width .16s ease;
+}
+
+#apply-progress-label {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
 .brand {
 	display: flex;
 	align-items: center;
@@ -167,6 +198,9 @@ h1 {
 	display: grid;
 	gap: 12px;
 	width: min(320px, calc(100vw - 16px));
+	max-height: calc(100dvh - 72px - env(safe-area-inset-bottom));
+	overflow-y: auto;
+	overscroll-behavior: contain;
 	border-radius: 2px;
 	background: #343434;
 	padding: 14px;
@@ -442,7 +476,7 @@ h1 {
 .rules-header,
 .rule-row {
 	display: grid;
-	grid-template-columns: 42px repeat(4, 38px) minmax(220px, 1fr);
+	grid-template-columns: repeat(4, 38px) minmax(220px, 1fr);
 	align-items: center;
 }
 
@@ -450,7 +484,7 @@ h1 {
 	position: sticky;
 	top: 56px;
 	z-index: 10;
-	min-width: 414px;
+	min-width: 372px;
 	height: 34px;
 	background: #292b29;
 	border-bottom: 1px solid var(--line);
@@ -477,7 +511,7 @@ h1 {
 
 .rules-list {
 	display: grid;
-	min-width: 414px;
+	min-width: 372px;
 }
 
 .rule-row {
@@ -492,35 +526,6 @@ h1 {
 
 .rule-row.is-blocked {
 	border-left: 0;
-}
-
-.app-icon-wrapper {
-	display: grid;
-	place-items: center;
-	width: 36px;
-	height: 36px;
-	margin: 0 auto;
-}
-
-.app-icon-img {
-	width: 36px;
-	height: 36px;
-	border-radius: 50%;
-	object-fit: cover;
-}
-
-.app-icon {
-	display: grid;
-	place-items: center;
-	width: 36px;
-	height: 36px;
-	margin: 0 auto;
-	border-radius: 50%;
-	background: #9ad22e;
-	color: #263616;
-	font-size: .72rem;
-	font-weight: 900;
-	text-transform: uppercase;
 }
 
 .scope-toggle,
@@ -572,6 +577,7 @@ h1 {
 .app-name {
 	display: flex;
 	align-items: center;
+	flex-wrap: wrap;
 	gap: 7px;
 	min-width: 0;
 }
@@ -579,12 +585,10 @@ h1 {
 .package {
 	display: block;
 	min-width: 0;
-	overflow: hidden;
+	overflow-wrap: anywhere;
 	color: #f1f1f1;
 	font-size: .98rem;
 	font-weight: 420;
-	text-overflow: ellipsis;
-	white-space: nowrap;
 }
 
 .state-pill {

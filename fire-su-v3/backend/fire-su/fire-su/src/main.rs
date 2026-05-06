@@ -44,6 +44,7 @@ const BLOCK_DNS: u32 = 1 << 5;
 const BPF_PROG_ATTACH: libc::c_uint = 8;
 const BPF_PROG_DETACH: libc::c_uint = 9;
 const BPF_CGROUP_INET_EGRESS: u32 = 1;
+const BPF_F_ALLOW_MULTI: u32 = 1 << 1;
 
 #[derive(Debug, Parser)]
 #[command(name = "fire-su")]
@@ -67,6 +68,10 @@ enum CliCommand {
     Export,
     #[command(name = "list-apps")]
     ListApps,
+    #[command(name = "app-icon")]
+    AppIcon {
+        package: String,
+    },
     Apply,
     Disable,
     Status,
@@ -365,11 +370,51 @@ struct AppState {
     stats_map: Mutex<BpfHashMap<aya::maps::MapData, u64, TrafficStats>>,
     events_map: Mutex<BpfHashMap<aya::maps::MapData, u64, BlockEvent>>,
     config_dir: PathBuf,
+    program_mode: FirewallProgramMode,
     iface_indexes: Mutex<HashMap<String, u32>>,
     log_tx: tokio::sync::broadcast::Sender<fire_su_common::ConnectionLog>,
 }
 
 type SharedState = Arc<AppState>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FirewallProgramMode {
+    Advanced,
+    Basic,
+    UidOnly,
+    Minimal,
+}
+
+impl FirewallProgramMode {
+    fn program_name(self) -> &'static str {
+        match self {
+            Self::Advanced => "fire_su",
+            Self::Basic => "fire_su_basic",
+            Self::UidOnly => "fire_su_uid",
+            Self::Minimal => "fire_su_min",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Advanced => "advanced",
+            Self::Basic => "basic",
+            Self::UidOnly => "uid-only",
+            Self::Minimal => "minimal",
+        }
+    }
+
+    fn uses_interface_rules(self) -> bool {
+        matches!(self, Self::Advanced | Self::Basic)
+    }
+
+    fn uid_mask(self, bits: RuleBits) -> u32 {
+        match self {
+            Self::Advanced | Self::Basic => bits.mask() & (BLOCK_INTERNET | BLOCK_LAN | BLOCK_DNS),
+            Self::UidOnly | Self::Minimal => bits.mask(),
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -388,6 +433,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
+        CliCommand::AppIcon { package } => print_app_icon(&package)?,
         CliCommand::Apply => apply_runtime(&opt).await?,
         CliCommand::Disable => disable_runtime(&opt)?,
         CliCommand::Status => status_runtime(&opt)?,
@@ -539,6 +585,12 @@ async fn run_daemon(opt: Opt) -> anyhow::Result<()> {
         ebpf.take_map("BLOCK_EVENTS")
             .context("BLOCK_EVENTS map missing")?,
     )?;
+    let program_mode = load_firewall_program(&mut ebpf)?;
+    eprintln!(
+        "fire-su: eBPF program loaded mode={} program={}",
+        program_mode.label(),
+        program_mode.program_name()
+    );
 
     let (log_tx, _) = tokio::sync::broadcast::channel(1000);
 
@@ -547,6 +599,7 @@ async fn run_daemon(opt: Opt) -> anyhow::Result<()> {
         stats_map: Mutex::new(stats_map),
         events_map: Mutex::new(events_map),
         config_dir: opt.config_dir.clone(),
+        program_mode,
         iface_indexes: Mutex::new(HashMap::new()),
         log_tx,
     });
@@ -560,11 +613,9 @@ async fn run_daemon(opt: Opt) -> anyhow::Result<()> {
     sync_bpf_map(&state).await?;
 
     let program: &mut CgroupSkb = ebpf
-        .program_mut("fire_su")
-        .context("fire_su missing")?
+        .program_mut(program_mode.program_name())
+        .with_context(|| format!("{} missing", program_mode.program_name()))?
         .try_into()?;
-    program.load().context("load fire_su eBPF program")?;
-    eprintln!("fire-su: eBPF program loaded");
     let cgroup = fs::File::open(&cgroup_path).with_context(|| {
         format!(
             "open {} (exists={}, uid={}, euid={})",
@@ -722,8 +773,9 @@ async fn sync_bpf_map(state: &AppState) -> anyhow::Result<()> {
     let apps = list_apps();
     let iface_indexes = state.iface_indexes.lock().await.clone();
     eprintln!(
-        "fire-su: sync start mode={} configured_rules={} apps={} interfaces={}",
+        "fire-su: sync start mode={} program_mode={} configured_rules={} apps={} interfaces={}",
         mode.as_str(),
+        state.program_mode.label(),
         rules.len(),
         apps.len(),
         iface_indexes.len()
@@ -772,7 +824,13 @@ async fn sync_bpf_map(state: &AppState) -> anyhow::Result<()> {
         if !bits.any() {
             continue;
         }
-        inserted_entries += insert_uid_rules(&mut bpf_map, app.uid, bits, &iface_indexes)?;
+        inserted_entries += insert_uid_rules(
+            &mut bpf_map,
+            state.program_mode,
+            app.uid,
+            bits,
+            &iface_indexes,
+        )?;
     }
     for target in rules.keys() {
         if !matched_targets.contains(target) {
@@ -790,12 +848,13 @@ async fn sync_bpf_map(state: &AppState) -> anyhow::Result<()> {
 
 fn insert_uid_rules(
     bpf_map: &mut BpfHashMap<aya::maps::MapData, u64, u32>,
+    program_mode: FirewallProgramMode,
     uid: u32,
     bits: RuleBits,
     iface_indexes: &HashMap<String, u32>,
 ) -> anyhow::Result<usize> {
     let mut inserted_entries = 0usize;
-    let global_mask = bits.mask() & (BLOCK_INTERNET | BLOCK_LAN | BLOCK_DNS);
+    let global_mask = program_mode.uid_mask(bits);
     if global_mask != 0 {
         bpf_map.insert(uid as u64, global_mask, 0)?;
         inserted_entries += 1;
@@ -806,6 +865,10 @@ fn insert_uid_rules(
             global_mask,
             format_rule_bits(bits)
         );
+    }
+
+    if !program_mode.uses_interface_rules() {
+        return Ok(inserted_entries);
     }
 
     for (name, ifindex) in iface_indexes {
@@ -1069,6 +1132,47 @@ fn daemon_reachable(bind_addr: &str) -> bool {
     response.starts_with("HTTP/1.1 200")
 }
 
+fn load_firewall_program(ebpf: &mut aya::Ebpf) -> anyhow::Result<FirewallProgramMode> {
+    let mut errors = Vec::new();
+    for mode in [
+        FirewallProgramMode::Advanced,
+        FirewallProgramMode::Basic,
+        FirewallProgramMode::UidOnly,
+        FirewallProgramMode::Minimal,
+    ] {
+        let Some(program) = ebpf.program_mut(mode.program_name()) else {
+            errors.push(format!("{}: missing", mode.program_name()));
+            continue;
+        };
+        let program: &mut CgroupSkb = match program.try_into() {
+            Ok(program) => program,
+            Err(error) => {
+                errors.push(format!("{}: {error:#}", mode.program_name()));
+                continue;
+            }
+        };
+        match program.load() {
+            Ok(()) => {
+                if !errors.is_empty() {
+                    eprintln!(
+                        "fire-su: using fallback eBPF program mode={} after load errors: {}",
+                        mode.label(),
+                        errors.join(" | ")
+                    );
+                }
+                return Ok(mode);
+            }
+            Err(error) => {
+                errors.push(format!("{}: {error:#}", mode.program_name()));
+            }
+        }
+    }
+    bail!(
+        "load fire-su eBPF program failed for all modes: {}",
+        errors.join(" | ")
+    );
+}
+
 fn http_error_summary(response: &str) -> String {
     let status = response.lines().next().unwrap_or("invalid daemon response");
     let body = response.split("\r\n\r\n").nth(1).unwrap_or("").trim();
@@ -1096,8 +1200,26 @@ fn attach_cgroup_skb_legacy(
     cgroup_fd: i32,
     attach_type: CgroupSkbAttachType,
 ) -> anyhow::Result<()> {
-    bpf_prog_attach_cmd(BPF_PROG_ATTACH, prog_fd, cgroup_fd, attach_type)
-        .with_context(|| format!("bpf_prog_attach failed for cgroup fd {cgroup_fd}"))
+    match bpf_prog_attach_cmd(
+        BPF_PROG_ATTACH,
+        prog_fd,
+        cgroup_fd,
+        attach_type,
+        BPF_F_ALLOW_MULTI,
+    ) {
+        Ok(()) => Ok(()),
+        Err(first_error) => {
+            eprintln!(
+                "fire-su: attach with BPF_F_ALLOW_MULTI failed: {first_error}; retrying without attach flags"
+            );
+            bpf_prog_attach_cmd(BPF_PROG_ATTACH, prog_fd, cgroup_fd, attach_type, 0)
+                .with_context(|| {
+                    format!(
+                        "bpf_prog_attach failed for cgroup fd {cgroup_fd}; first BPF_F_ALLOW_MULTI error: {first_error}"
+                    )
+                })
+        }
+    }
 }
 
 fn detach_cgroup_skb_legacy(
@@ -1105,7 +1227,7 @@ fn detach_cgroup_skb_legacy(
     cgroup_fd: i32,
     attach_type: CgroupSkbAttachType,
 ) -> anyhow::Result<()> {
-    bpf_prog_attach_cmd(BPF_PROG_DETACH, prog_fd, cgroup_fd, attach_type)
+    bpf_prog_attach_cmd(BPF_PROG_DETACH, prog_fd, cgroup_fd, attach_type, 0)
         .with_context(|| format!("bpf_prog_detach failed for cgroup fd {cgroup_fd}"))
 }
 
@@ -1114,12 +1236,13 @@ fn bpf_prog_attach_cmd(
     prog_fd: i32,
     cgroup_fd: i32,
     attach_type: CgroupSkbAttachType,
+    attach_flags: u32,
 ) -> anyhow::Result<()> {
     let mut attr = BpfProgAttachAttr {
         target_fd: cgroup_fd as u32,
         attach_bpf_fd: prog_fd as u32,
         attach_type: cgroup_skb_attach_type(attach_type),
-        attach_flags: 0,
+        attach_flags,
         replace_bpf_fd: 0,
         relative_fd: 0,
         expected_revision: 0,
@@ -1685,6 +1808,216 @@ fn list_apps() -> Vec<AppInfo> {
     apps.into_values().collect()
 }
 
+fn print_app_icon(package: &str) -> anyhow::Result<()> {
+    if !is_valid_package(package) {
+        bail!("invalid package: {package}");
+    }
+    for apk in package_apk_paths(package) {
+        let mut candidates = icon_paths_from_badging(&apk);
+        candidates.extend(fallback_icon_paths(&apk));
+        let mut seen = BTreeSet::new();
+        for entry in candidates {
+            if !seen.insert(entry.clone()) {
+                continue;
+            }
+            let Some(mime) = image_mime_for_path(&entry) else {
+                continue;
+            };
+            if let Some(bytes) = extract_zip_entry(&apk, &entry) {
+                if !bytes.is_empty() {
+                    println!("data:{mime};base64,{}", base64_encode(&bytes));
+                    return Ok(());
+                }
+            }
+        }
+    }
+    bail!("app icon not found for {package}");
+}
+
+fn package_apk_paths(package: &str) -> Vec<PathBuf> {
+    command_output("pm", &["path", package])
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("package:"))
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn icon_paths_from_badging(apk: &Path) -> Vec<String> {
+    let Some(apk_path) = apk.to_str() else {
+        return Vec::new();
+    };
+    let mut output = command_output("aapt", &["dump", "badging", apk_path]);
+    if output.is_empty() {
+        output = command_output("aapt2", &["dump", "badging", apk_path]);
+    }
+    let mut density_icons = Vec::new();
+    let mut generic_icons = Vec::new();
+    for line in output.lines() {
+        if let Some(rest) = line.strip_prefix("application-icon-") {
+            if let Some((density, _)) = rest.split_once(':') {
+                if let Some(path) = first_single_quoted(line) {
+                    density_icons.push((density.parse::<u32>().unwrap_or(0), path));
+                }
+            }
+        } else if line.starts_with("application-icon:") {
+            if let Some(path) = first_single_quoted(line) {
+                generic_icons.push(path);
+            }
+        } else if line.starts_with("application:") {
+            if let Some(path) = quoted_attr(line, "icon") {
+                generic_icons.push(path);
+            }
+        }
+    }
+    density_icons.sort_by(|a, b| b.0.cmp(&a.0));
+    density_icons
+        .into_iter()
+        .map(|(_, path)| path)
+        .chain(generic_icons)
+        .collect()
+}
+
+fn fallback_icon_paths(apk: &Path) -> Vec<String> {
+    let mut entries = zip_entries(apk);
+    entries.retain(|entry| {
+        let lower = entry.to_ascii_lowercase();
+        image_mime_for_path(&lower).is_some()
+            && (lower.contains("/ic_launcher")
+                || lower.contains("/launcher_icon")
+                || lower.contains("/icon.png")
+                || lower.contains("/icon.webp"))
+    });
+    entries.sort_by_key(|entry| std::cmp::Reverse(icon_candidate_score(entry)));
+    entries
+}
+
+fn icon_candidate_score(entry: &str) -> u32 {
+    let lower = entry.to_ascii_lowercase();
+    let mut score: u32 = 0;
+    if lower.contains("/mipmap-") {
+        score += 1000;
+    }
+    if lower.contains("ic_launcher") {
+        score += 500;
+    }
+    if lower.contains("xxxhdpi") {
+        score += 320;
+    } else if lower.contains("xxhdpi") {
+        score += 240;
+    } else if lower.contains("xhdpi") {
+        score += 160;
+    } else if lower.contains("hdpi") {
+        score += 120;
+    } else if lower.contains("nodpi") {
+        score += 80;
+    } else if lower.contains("mdpi") {
+        score += 40;
+    }
+    if lower.contains("round") {
+        score = score.saturating_sub(100);
+    }
+    score
+}
+
+fn zip_entries(apk: &Path) -> Vec<String> {
+    let mut stdout = Vec::new();
+    for toybox in [false, true] {
+        let output = if toybox {
+            Command::new("toybox")
+                .arg("unzip")
+                .arg("-l")
+                .arg(apk)
+                .output()
+        } else {
+            Command::new("unzip").arg("-l").arg(apk).output()
+        };
+        if let Ok(output) = output {
+            if output.status.success() && !output.stdout.is_empty() {
+                stdout = output.stdout;
+                break;
+            }
+        }
+    }
+    String::from_utf8_lossy(&stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().last())
+        .filter(|entry| entry.starts_with("res/"))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn extract_zip_entry(apk: &Path, entry: &str) -> Option<Vec<u8>> {
+    for toybox in [false, true] {
+        let output = if toybox {
+            Command::new("toybox")
+                .arg("unzip")
+                .arg("-p")
+                .arg(apk)
+                .arg(entry)
+                .output()
+        } else {
+            Command::new("unzip").arg("-p").arg(apk).arg(entry).output()
+        };
+        if let Ok(output) = output {
+            if output.status.success() && !output.stdout.is_empty() {
+                return Some(output.stdout);
+            }
+        }
+    }
+    None
+}
+
+fn image_mime_for_path(path: &str) -> Option<&'static str> {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".png") {
+        Some("image/png")
+    } else if lower.ends_with(".webp") {
+        Some("image/webp")
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        Some("image/jpeg")
+    } else if lower.ends_with(".gif") {
+        Some("image/gif")
+    } else {
+        None
+    }
+}
+
+fn first_single_quoted(line: &str) -> Option<String> {
+    let start = line.find('\'')? + 1;
+    let end = line[start..].find('\'')? + start;
+    Some(line[start..end].to_string())
+}
+
+fn quoted_attr(line: &str, name: &str) -> Option<String> {
+    let pattern = format!("{name}='");
+    let start = line.find(&pattern)? + pattern.len();
+    let end = line[start..].find('\'')? + start;
+    Some(line[start..end].to_string())
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        encoded.push(TABLE[(b0 >> 2) as usize] as char);
+        encoded.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            encoded.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+    encoded
+}
+
 fn list_user_ids() -> Vec<u32> {
     let output = format!(
         "{}\n{}",
@@ -1752,10 +2085,11 @@ fn bit(value: &str) -> u32 {
 }
 
 fn is_valid_package(package: &str) -> bool {
-    package.contains('.')
-        && package
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
+    package == "android"
+        || (package.contains('.')
+            && package
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_'))
 }
 
 fn is_valid_target(target: &str) -> bool {

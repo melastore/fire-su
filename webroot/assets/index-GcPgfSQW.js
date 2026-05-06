@@ -32,6 +32,7 @@ let expandedActivityUid = null;
 let expandedAppTarget = null;
 let groupFilter = readPref("groupFilter", "all");
 let appGroups = readJsonPref("appGroups", {});
+let pendingScrollY = null;
 
 const list = document.getElementById("apps-list");
 const empty = document.getElementById("empty");
@@ -49,6 +50,9 @@ const logsCount = document.getElementById("logs-count");
 const healthState = document.getElementById("health-state");
 const refreshButton = document.getElementById("refresh");
 const applyButton = document.getElementById("apply");
+const applyProgress = document.getElementById("apply-progress");
+const applyProgressBar = document.getElementById("apply-progress-bar");
+const applyProgressLabel = document.getElementById("apply-progress-label");
 const bulkAllowButton = document.getElementById("bulk-allow");
 const bulkBlockButton = document.getElementById("bulk-block");
 const settingsToggle = document.getElementById("settings-toggle");
@@ -63,6 +67,7 @@ const firstWhitelistButton = document.getElementById("first-whitelist");
 const backupData = document.getElementById("backup-data");
 const backupExportButton = document.getElementById("backup-export");
 const backupImportButton = document.getElementById("backup-import");
+const backupFileInput = document.createElement("input");
 const groupFilterInput = document.getElementById("group-filter");
 const groupNameInput = document.getElementById("group-name");
 const templateButtons = Array.from(document.querySelectorAll(".template-action"));
@@ -77,6 +82,10 @@ const viewPanels = {
 };
 
 if (!window.ksu && new URLSearchParams(location.search).has("mock")) installMockBridge();
+backupFileInput.type = "file";
+backupFileInput.accept = "application/json,.json";
+backupFileInput.hidden = true;
+document.body.appendChild(backupFileInput);
 
 function installMockBridge() {
 	const sampleApps = [
@@ -196,6 +205,28 @@ async function runCommands(commands) {
 	for (const command of commands) await run(command);
 }
 
+async function runCommandsWithProgress(commands) {
+	const total = commands.length;
+	for (const [index, command] of commands.entries()) {
+		setApplyProgress(index, total);
+		await run(command);
+	}
+	setApplyProgress(total, total);
+}
+
+function setApplyProgress(done, total) {
+	if (!total) {
+		applyProgress.hidden = true;
+		applyProgressBar.style.width = "0";
+		applyProgressLabel.textContent = "Applying";
+		return;
+	}
+	const percent = Math.round((done / total) * 100);
+	applyProgress.hidden = false;
+	applyProgressBar.style.width = `${percent}%`;
+	applyProgressLabel.textContent = done >= total ? "Apply complete" : `Applying ${done + 1} of ${total}`;
+}
+
 function toast(message) {
 	if (window.ksu && typeof window.ksu.toast === "function") window.ksu.toast(message);
 }
@@ -286,6 +317,17 @@ function setBusy(value) {
 	]) {
 		item.disabled = value;
 	}
+}
+
+function closeSettingsPanel() {
+	settingsPanel.hidden = true;
+	settingsToggle.setAttribute("aria-expanded", "false");
+}
+
+function keepFocusedFieldVisible(event) {
+	const field = event.target;
+	if (!settingsPanel.contains(field)) return;
+	setTimeout(() => field.scrollIntoView({ block: "center", inline: "nearest" }), 250);
 }
 
 function parseApps(output) {
@@ -409,6 +451,8 @@ function markDirty() {
 }
 
 function render() {
+	const restoreScrollY = pendingScrollY;
+	pendingScrollY = null;
 	renderQueued = false;
 	const visible = sortedVisibleApps();
 	list.textContent = "";
@@ -425,10 +469,15 @@ function render() {
 	renderActivity();
 	renderDoctor();
 	markDirty();
+	if (restoreScrollY !== null) {
+		window.scrollTo(0, restoreScrollY);
+		requestAnimationFrame(() => window.scrollTo(0, restoreScrollY));
+	}
 }
 
-function queueRender() {
+function queueRender(preserveScroll = true) {
 	if (renderQueued) return;
+	if (preserveScroll) pendingScrollY = window.scrollY;
 	renderQueued = true;
 	requestAnimationFrame(render);
 }
@@ -482,23 +531,6 @@ function renderRow(app) {
 	const row = document.createElement("article");
 	row.className = `rule-row${state !== "allow" ? " is-blocked" : ""}`;
 
-	const iconWrapper = document.createElement("div");
-	iconWrapper.className = "app-icon-wrapper";
-	
-	const iconImg = document.createElement("img");
-	iconImg.className = "app-icon-img";
-	iconImg.src = `android.resource://${app.packageName}/mipmap/ic_launcher`;
-	iconImg.setAttribute("alt", "");
-	iconImg.onerror = () => {
-		iconImg.style.display = "none";
-		const initialsDiv = document.createElement("div");
-		initialsDiv.className = "app-icon";
-		initialsDiv.textContent = initials(app.packageName);
-		iconWrapper.appendChild(initialsDiv);
-	};
-	iconWrapper.appendChild(iconImg);
-	row.appendChild(iconWrapper);
-
 	for (const scope of scopes) {
 		const on = Number(rule[scope.key]) === 1;
 		const button = document.createElement("button");
@@ -507,7 +539,8 @@ function renderRow(app) {
 		button.textContent = "";
 		button.title = `${scope.label}: ${on ? "blocked" : "allowed"}`;
 		button.setAttribute("aria-pressed", String(on));
-		button.addEventListener("click", () => toggleScope(app, scope.key));
+		button.dataset.scope = scope.key;
+		button.addEventListener("click", () => toggleScope(app, scope.key, row));
 		row.appendChild(button);
 	}
 
@@ -596,12 +629,6 @@ function renderAppDetail(app) {
 	return detail;
 }
 
-function initials(packageName) {
-	const parts = packageName.split(".").filter(Boolean);
-	const last = parts[parts.length - 1] || packageName;
-	return last.slice(0, 2);
-}
-
 function appMeta(app, rule) {
 	const meta = [
 		app.uid ? `UID ${app.uid}` : "UID unknown",
@@ -682,12 +709,46 @@ function storeNextRule(app, nextRule) {
 	rules.set(target, normalized);
 }
 
-function toggleScope(app, scope) {
+function updateRuleRow(row, app) {
+	const rule = effectiveRule(app);
+	const state = ruleState(rule);
+	row.className = `rule-row${state !== "allow" ? " is-blocked" : ""}`;
+	for (const scope of scopes) {
+		const button = row.querySelector(`.scope-toggle[data-scope="${scope.key}"]`);
+		if (!button) continue;
+		const on = Number(rule[scope.key]) === 1;
+		button.classList.toggle("is-on", on);
+		button.title = `${scope.label}: ${on ? "blocked" : "allowed"}`;
+		button.setAttribute("aria-pressed", String(on));
+	}
+	const pill = row.querySelector(".state-pill");
+	if (pill) {
+		pill.className = `state-pill${state !== "allow" ? " is-blocked" : ""}`;
+		pill.textContent = state;
+	}
+	const meta = row.querySelector(".app-meta");
+	if (meta) {
+		meta.textContent = "";
+		for (const text of appMeta(app, rule)) {
+			const item = document.createElement("span");
+			item.textContent = text;
+			meta.appendChild(item);
+		}
+	}
+	const detail = row.nextElementSibling;
+	if (expandedAppTarget === targetFor(app) && detail?.classList.contains("app-detail")) {
+		detail.replaceWith(renderAppDetail(app));
+	}
+	blockedCount.textContent = String(list.querySelectorAll(".rule-row.is-blocked").length);
+	markDirty();
+}
+
+function toggleScope(app, scope, row) {
 	if (busy) return;
 	const current = cloneRule(effectiveRule(app));
 	current[scope] = Number(current[scope]) === 1 ? 0 : 1;
 	storeNextRule(app, current);
-	queueRender();
+	updateRuleRow(row, app);
 }
 
 function setAllScopes(app, nextRule) {
@@ -880,7 +941,8 @@ async function applyRules() {
 	try {
 		const commands = stageCommands();
 		commands.push(`${COMMAND} apply`);
-		await runCommands(commands);
+		window.scrollTo({ top: 0, behavior: "smooth" });
+		await runCommandsWithProgress(commands);
 		await load();
 		setStatus("Firewall rules applied", "ok");
 	} catch (error) {
@@ -889,6 +951,7 @@ async function applyRules() {
 		await load();
 	} finally {
 		setBusy(false);
+		setTimeout(() => setApplyProgress(0, 0), 700);
 	}
 }
 
@@ -930,13 +993,34 @@ function exportBackup() {
 		rules: Array.from(rules, ([target, rule]) => ({ target, ...cloneRule(rule) })),
 		groups: appGroups,
 	};
-	backupData.value = JSON.stringify(payload, null, 2);
-	setStatus("Profile JSON exported", "ok");
+	const json = JSON.stringify(payload, null, 2);
+	backupData.value = json;
+	downloadBackup(json);
+	setStatus("Backup file exported", "ok");
+}
+
+function downloadBackup(json) {
+	const blob = new Blob([json], { type: "application/json" });
+	const url = URL.createObjectURL(blob);
+	const link = document.createElement("a");
+	const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+	link.href = url;
+	link.download = `fire-su-backup-${stamp}.json`;
+	document.body.appendChild(link);
+	link.click();
+	link.remove();
+	setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function importBackup() {
+	backupFileInput.value = "";
+	backupFileInput.click();
+}
+
+function importBackupText(text) {
 	try {
-		const data = JSON.parse(backupData.value || "{}");
+		backupData.value = text;
+		const data = JSON.parse(text || "{}");
 		if (!Array.isArray(data.rules)) throw new Error("Backup JSON has no rules array");
 		if (data.defaultMode === "blacklist" || data.defaultMode === "whitelist") defaultMode = data.defaultMode;
 		rules = new Map(data.rules.map((item) => [item.target, normalizeVisibleRule(item)]));
@@ -995,6 +1079,17 @@ settingsToggle.addEventListener("click", () => {
 	settingsPanel.hidden = !expanded;
 	settingsToggle.setAttribute("aria-expanded", String(expanded));
 });
+document.addEventListener("pointerdown", (event) => {
+	if (settingsPanel.hidden) return;
+	if (settingsPanel.contains(event.target) || settingsToggle.contains(event.target)) return;
+	closeSettingsPanel();
+});
+document.addEventListener("keydown", (event) => {
+	if (event.key === "Escape") closeSettingsPanel();
+});
+for (const field of [profileNameInput, groupNameInput, backupData]) {
+	field.addEventListener("focus", keepFocusedFieldVisible);
+}
 
 showSystemInput.addEventListener("change", () => {
 	showSystem = showSystemInput.checked;
@@ -1046,6 +1141,17 @@ bulkAllowButton.addEventListener("click", () => bulkSet(emptyRule()));
 bulkBlockButton.addEventListener("click", () => bulkSet(blockedRule()));
 backupExportButton.addEventListener("click", exportBackup);
 backupImportButton.addEventListener("click", importBackup);
+backupFileInput.addEventListener("change", () => {
+	const file = backupFileInput.files?.[0];
+	if (!file) return;
+	const reader = new FileReader();
+	reader.onload = () => importBackupText(String(reader.result || ""));
+	reader.onerror = () => {
+		setStatus("Could not read backup file", "error");
+		toast("Could not read backup file");
+	};
+	reader.readAsText(file);
+});
 firstBlacklistButton.addEventListener("click", () => {
 	defaultMode = "blacklist";
 	writePref("firstRunDone", "1");

@@ -22,6 +22,10 @@
 				<button id="apply" class="tool-button primary" type="button" aria-label="Apply" title="Apply">✓</button>
 				<button id="settings-toggle" class="tool-button" type="button" aria-label="Menu" aria-expanded="false" title="Menu">⋮</button>
 			</section>
+			<div id="apply-progress" class="apply-progress" hidden>
+				<div id="apply-progress-bar"></div>
+				<span id="apply-progress-label">Applying</span>
+			</div>
 		</header>
 
 		<section id="settings-panel" class="settings-panel" aria-label="Actions" hidden>
@@ -65,11 +69,11 @@
 			</div>
 			<div class="backup-tools">
 				<span class="control-label">Backup</span>
-				<textarea id="backup-data" rows="4" spellcheck="false" placeholder="Export or paste profile JSON"></textarea>
 				<div>
 					<button id="backup-export" class="tool-button quiet" type="button">Export</button>
 					<button id="backup-import" class="tool-button quiet" type="button">Import</button>
 				</div>
+				<textarea id="backup-data" rows="4" spellcheck="false" placeholder="Export or paste profile JSON" hidden></textarea>
 			</div>
 			<div class="profile-tools">
 				<label for="profile-name">Profile name</label>
@@ -127,7 +131,6 @@
 			</div>
 
 			<div class="rules-header" aria-hidden="true">
-				<span></span>
 				<span class="column-header" data-scope="wifi">Wi-Fi</span>
 				<span class="column-header" data-scope="mobile">Mob</span>
 				<span class="column-header" data-scope="vpn">VPN</span>

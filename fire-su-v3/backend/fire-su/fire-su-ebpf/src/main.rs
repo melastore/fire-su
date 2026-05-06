@@ -30,16 +30,42 @@ pub fn fire_su(ctx: SkBuffContext) -> i32 {
     }
 }
 
+#[cgroup_skb]
+pub fn fire_su_basic(ctx: SkBuffContext) -> i32 {
+    match try_fire_su_basic(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+#[cgroup_skb]
+pub fn fire_su_uid(ctx: SkBuffContext) -> i32 {
+    match try_fire_su_uid(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+#[cgroup_skb]
+pub fn fire_su_min(ctx: SkBuffContext) -> i32 {
+    match try_fire_su_min(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
 fn try_fire_su(ctx: SkBuffContext) -> Result<i32, i32> {
     let uid = ctx.skb.get_socket_uid() as u64;
     let ifindex = unsafe { (*ctx.skb.skb).ifindex as u64 };
     let bytes = ctx.skb.len();
     let packet = packet_info(&ctx);
 
-    let iface_key = (ifindex << 32) | uid;
-    if let Some(reason) = unsafe { BLOCK_LIST.get(&iface_key) } {
-        record(uid, ifindex as u32, *reason, bytes, true);
-        return Ok(0);
+    if ifindex != 0 {
+        let iface_key = (ifindex << 32) | uid;
+        if let Some(reason) = unsafe { BLOCK_LIST.get(&iface_key) } {
+            record(uid, ifindex as u32, *reason, bytes, true);
+            return Ok(0);
+        }
     }
 
     let Some(mask) = (unsafe { BLOCK_LIST.get(&uid) }) else {
@@ -64,6 +90,84 @@ fn try_fire_su(ctx: SkBuffContext) -> Result<i32, i32> {
 
     record(uid, ifindex as u32, 0, bytes, false);
     Ok(1)
+}
+
+fn try_fire_su_basic(ctx: SkBuffContext) -> Result<i32, i32> {
+    let uid = ctx.skb.get_socket_uid() as u64;
+    let ifindex = unsafe { (*ctx.skb.skb).ifindex as u64 };
+    let bytes = ctx.skb.len();
+
+    if ifindex != 0 {
+        let iface_key = (ifindex << 32) | uid;
+        if let Some(reason) = unsafe { BLOCK_LIST.get(&iface_key) } {
+            record(uid, ifindex as u32, *reason, bytes, true);
+            return Ok(0);
+        }
+    }
+
+    let Some(mask) = (unsafe { BLOCK_LIST.get(&uid) }) else {
+        record(uid, ifindex as u32, 0, bytes, false);
+        return Ok(1);
+    };
+
+    let reason = global_reason(*mask);
+    if reason != 0 {
+        record(uid, ifindex as u32, reason, bytes, true);
+        return Ok(0);
+    }
+
+    record(uid, ifindex as u32, 0, bytes, false);
+    Ok(1)
+}
+
+fn try_fire_su_uid(ctx: SkBuffContext) -> Result<i32, i32> {
+    let uid = ctx.skb.get_socket_uid() as u64;
+    let bytes = ctx.skb.len();
+
+    if let Some(mask) = unsafe { BLOCK_LIST.get(&uid) } {
+        let reason = any_reason(*mask);
+        if reason != 0 {
+            record(uid, 0, reason, bytes, true);
+            return Ok(0);
+        }
+    }
+
+    record(uid, 0, 0, bytes, false);
+    Ok(1)
+}
+
+fn try_fire_su_min(ctx: SkBuffContext) -> Result<i32, i32> {
+    let uid = ctx.skb.get_socket_uid() as u64;
+    if let Some(mask) = unsafe { BLOCK_LIST.get(&uid) } {
+        if *mask != 0 {
+            return Ok(0);
+        }
+    }
+    Ok(1)
+}
+
+fn global_reason(mask: u32) -> u32 {
+    if mask & BLOCK_INTERNET != 0 {
+        BLOCK_INTERNET
+    } else if mask & BLOCK_LAN != 0 {
+        BLOCK_LAN
+    } else if mask & BLOCK_DNS != 0 {
+        BLOCK_DNS
+    } else {
+        0
+    }
+}
+
+fn any_reason(mask: u32) -> u32 {
+    if mask & BLOCK_INTERNET != 0 {
+        BLOCK_INTERNET
+    } else if mask & BLOCK_LAN != 0 {
+        BLOCK_LAN
+    } else if mask & BLOCK_DNS != 0 {
+        BLOCK_DNS
+    } else {
+        mask & mask.wrapping_neg()
+    }
 }
 
 #[derive(Clone, Copy)]
