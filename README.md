@@ -25,9 +25,15 @@ The result is simple:
 app UID + network type -> allow or block
 ```
 
-The daemon keeps the eBPF maps synced with your WebUI changes. If a device kernel rejects the most advanced eBPF program, `fire-su` automatically tries smaller fallback programs so more devices can still run basic blocking.
+The daemon keeps the eBPF maps synced with your WebUI changes, and picks up new interfaces (a VPN tunnel, mobile data coming up) and newly installed apps within a couple of seconds. If a device kernel rejects the most advanced eBPF program, `fire-su` automatically tries smaller fallback programs so more devices can still run basic blocking. The Health tab shows which one is running.
 
-Note: older builds had a DNS rule field. The latest WebUI does not expose DNS as a separate control; rules are focused on internet, Wi-Fi, mobile data, VPN, and LAN.
+A few rules worth knowing:
+
+- Localhost is never blocked. Apps can always reach services on `127.0.0.1`.
+- LAN traffic follows the LAN toggle only, whatever interface it goes over. "LAN open" really keeps your local network reachable while Wi-Fi internet is blocked.
+- When Wi-Fi, mobile and VPN are all blocked, the app is also blocked on interfaces fire-su can't classify (USB, Ethernet, odd vendor names).
+- Whitelist mode does not block core Android UIDs below 10000 (system, network stack, Bluetooth) unless you add a rule for them. Blocking those tends to make Android think Wi-Fi has no internet.
+- DNS rules were removed. Old rule files are migrated on read.
 
 ## Install
 
@@ -74,6 +80,8 @@ fire-su mode blacklist
 fire-su set com.example.app@0 mobile 1
 fire-su set com.example.app@0 wifi 0
 fire-su temp-set com.example.app@0 visible 1 900
+printf '%s\n' 'com.example.app@0|0|1|1|0' | fire-su stage-rules
+fire-su apply
 fire-su profile-save daily
 fire-su apply
 fire-su disable
@@ -93,7 +101,11 @@ visible
 all
 ```
 
-`visible` means Wi-Fi, mobile, VPN, and LAN together. It is useful for simple temporary blocks from the WebUI.
+`internet` sets Wi-Fi, mobile and VPN together. `visible` and `all` also include LAN.
+
+`stage-rules` reads whole rules from stdin, one `target|wifi|mobile|vpn|lan` per line, and writes them in one go. `stage-*` commands only save; run `fire-su apply` to push them to the daemon.
+
+The CLI talks to the daemon over a root-only socket at `/data/adb/fire-su/fire-su.sock`. Older builds used `127.0.0.1:3000`, which let any app read your traffic counters.
 
 ## Build
 
@@ -124,7 +136,7 @@ The script creates `fire-su.zip` at the repository root.
 ```text
 fire-su-v3/backend/fire-su/   Rust userspace daemon and eBPF workspace
 system/bin/fire-su            Android module binary
-webroot/                      WebUI bundle
+webroot/                      WebUI (plain HTML/CSS/JS, no build step)
 META-INF/                     Flashable module compatibility files
 customize.sh                  Install-time setup
 service.sh                    Boot-time daemon launcher
@@ -139,8 +151,10 @@ This project is still low-level Android firewall software. Test on your own devi
 
 ```sh
 fire-su doctor
-fire-su logs
+fire-su debug
 ```
+
+The daemon log is at `/data/adb/fire-su/fire-su.log`, and the previous boot's log is kept as `fire-su.log.1`. `service.sh` restarts the daemon if it crashes, and a fresh daemon removes any fire-su program a dead one left attached.
 
 ## License
 

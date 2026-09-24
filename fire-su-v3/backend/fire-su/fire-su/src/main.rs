@@ -7,7 +7,7 @@ use axum::{
 };
 use aya::{
     maps::HashMap as BpfHashMap,
-    programs::{CgroupSkb, CgroupSkbAttachType},
+    programs::{CgroupSkb, CgroupSkbAttachType, loaded_programs},
 };
 use clap::{Parser, Subcommand};
 use fire_su_common::{BlockEvent, TrafficStats};
@@ -15,14 +15,16 @@ use futures::stream::StreamExt;
 use log::{debug, info, warn};
 use netlink_packet_core::NetlinkPayload;
 use netlink_packet_route::{RouteNetlinkMessage, link::LinkAttribute};
-use rtnetlink::new_connection;
+use rtnetlink::{MulticastGroup, new_connection, new_multicast_connection};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
-    io::{Read, Write},
-    net::TcpStream,
-    os::fd::{AsFd, AsRawFd},
+    io::{BufRead, Read, Write},
+    os::{
+        fd::{AsFd, AsRawFd},
+        unix::{fs::PermissionsExt, net::UnixStream, process::CommandExt},
+    },
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Arc,
@@ -34,15 +36,16 @@ const DEFAULT_CONFIG_DIR: &str = "/data/adb/fire-su";
 const DEFAULT_CGROUP_PATH: &str = "auto";
 const ANDROID_BPF_CGROUP_PATH: &str = "/dev/cg2_bpf";
 const LINUX_CGROUP_PATH: &str = "/sys/fs/cgroup";
-const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3000";
+const PACKAGES_LIST: &str = "/data/system/packages.list";
+const USERS_DIR: &str = "/data/system/users";
 const BLOCK_INTERNET: u32 = 1 << 0;
 const BLOCK_WIFI: u32 = 1 << 1;
 const BLOCK_MOBILE: u32 = 1 << 2;
 const BLOCK_VPN: u32 = 1 << 3;
 const BLOCK_LAN: u32 = 1 << 4;
-const BLOCK_DNS: u32 = 1 << 5;
 const BPF_PROG_ATTACH: libc::c_uint = 8;
 const BPF_PROG_DETACH: libc::c_uint = 9;
+const BPF_PROG_QUERY: libc::c_uint = 16;
 const BPF_CGROUP_INET_EGRESS: u32 = 1;
 const BPF_F_ALLOW_MULTI: u32 = 1 << 1;
 
@@ -55,11 +58,20 @@ struct Opt {
     #[arg(short, long, default_value = DEFAULT_CGROUP_PATH)]
     cgroup_path: PathBuf,
 
-    #[arg(short, long, default_value = DEFAULT_BIND_ADDR)]
-    bind_addr: String,
+    /// Control socket, defaults to <config-dir>/fire-su.sock
+    #[arg(short, long)]
+    socket: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Option<CliCommand>,
+}
+
+impl Opt {
+    fn socket(&self) -> PathBuf {
+        self.socket
+            .clone()
+            .unwrap_or_else(|| self.config_dir.join("fire-su.sock"))
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -114,6 +126,9 @@ enum CliCommand {
         scope: String,
         value: String,
     },
+    /// Replace whole rules from stdin, one `target|wifi|mobile|vpn|lan` per line
+    #[command(name = "stage-rules")]
+    StageRules,
     Block {
         targets: Vec<String>,
     },
@@ -165,18 +180,15 @@ impl Mode {
     fn default_rule(self) -> RuleBits {
         match self {
             Self::Blacklist => RuleBits::default(),
-            Self::Whitelist => RuleBits {
-                internet: 1,
-                wifi: 1,
-                mobile: 1,
-                vpn: 1,
-                lan: 1,
-                dns: 1,
-            },
+            Self::Whitelist => RuleBits::from_visible(1, 1, 1, 1),
         }
     }
 }
 
+// `internet` is not set on its own: it is on exactly when Wi-Fi, mobile and
+// VPN are all blocked, and then also covers interfaces we can't classify.
+// Keeping it independent let the WebUI (which only shows the four visible
+// bits) leave apps fully blocked after the user allowed a network.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 struct RuleBits {
     internet: u32,
@@ -184,17 +196,44 @@ struct RuleBits {
     mobile: u32,
     vpn: u32,
     lan: u32,
-    dns: u32,
 }
 
 impl RuleBits {
+    fn from_visible(wifi: u32, mobile: u32, vpn: u32, lan: u32) -> Self {
+        let mut bits = Self {
+            internet: 0,
+            wifi,
+            mobile,
+            vpn,
+            lan,
+        };
+        bits.normalize();
+        bits
+    }
+
+    // Columns are internet|wifi|mobile|vpn|lan[|dns]. A lone internet=1 from
+    // the CLI means all WAN blocked. With dns=1 it is the old whitelist default
+    // after the user cleared every network in the WebUI, which meant "allow".
+    fn from_columns(columns: &[&str]) -> Self {
+        let internet = bit(columns[0]);
+        let dns = columns.get(5).map(|value| bit(value)).unwrap_or(0);
+        let (mut wifi, mut mobile, mut vpn) = (bit(columns[1]), bit(columns[2]), bit(columns[3]));
+        if internet == 1 && dns == 0 && wifi == 0 && mobile == 0 && vpn == 0 {
+            (wifi, mobile, vpn) = (1, 1, 1);
+        }
+        Self::from_visible(wifi, mobile, vpn, bit(columns[4]))
+    }
+
+    fn normalize(&mut self) {
+        self.internet = self.wifi & self.mobile & self.vpn;
+    }
+
     fn mask(self) -> u32 {
         (self.internet * BLOCK_INTERNET)
             | (self.wifi * BLOCK_WIFI)
             | (self.mobile * BLOCK_MOBILE)
             | (self.vpn * BLOCK_VPN)
             | (self.lan * BLOCK_LAN)
-            | (self.dns * BLOCK_DNS)
     }
 
     fn any(self) -> bool {
@@ -203,29 +242,34 @@ impl RuleBits {
 
     fn set(&mut self, scope: &str, value: u32) -> anyhow::Result<()> {
         match scope {
-            "internet" => self.internet = value,
             "wifi" => self.wifi = value,
             "mobile" => self.mobile = value,
             "vpn" => self.vpn = value,
             "lan" => self.lan = value,
-            "dns" => self.dns = value,
-            "visible" | "networks" => {
+            "internet" => {
+                self.wifi = value;
+                self.mobile = value;
+                self.vpn = value;
+            }
+            "visible" | "networks" | "all" => {
                 self.wifi = value;
                 self.mobile = value;
                 self.vpn = value;
                 self.lan = value;
             }
-            "all" => {
-                self.internet = value;
-                self.wifi = value;
-                self.mobile = value;
-                self.vpn = value;
-                self.lan = value;
-                self.dns = value;
-            }
+            "dns" => bail!("dns rules were removed; use internet or lan"),
             _ => bail!("invalid scope: {scope}"),
         }
+        self.normalize();
         Ok(())
+    }
+
+    // Trailing 0 keeps the dns column so older builds still parse the file.
+    fn columns(self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}|0",
+            self.internet, self.wifi, self.mobile, self.vpn, self.lan
+        )
     }
 }
 
@@ -240,7 +284,6 @@ struct Rule {
     mobile: u32,
     vpn: u32,
     lan: u32,
-    dns: u32,
     #[serde(rename = "temporaryUntil", skip_serializing_if = "Option::is_none")]
     temporary_until: Option<u64>,
 }
@@ -258,13 +301,10 @@ impl Rule {
             mobile: bits.mobile,
             vpn: bits.vpn,
             lan: bits.lan,
-            dns: bits.dns,
             temporary_until,
         }
     }
 }
-
-// removed duplicate TrafficStats and BlockEvent
 
 #[derive(Clone, Debug, Serialize)]
 struct StatRow {
@@ -280,8 +320,11 @@ struct StatRow {
 struct LogRow {
     uid: u32,
     ifindex: u32,
+    iface: String,
     reason: String,
     bytes: u32,
+    // seconds since the packet was dropped
+    ago: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -293,7 +336,7 @@ struct DebugReport {
     arch: String,
     kernel: String,
     config_dir: String,
-    bind_addr: String,
+    socket: String,
     cgroup_path: String,
     cgroup_exists: bool,
     bpf_filesystem_exists: bool,
@@ -318,7 +361,6 @@ struct DebugRule {
     mobile: u32,
     vpn: u32,
     lan: u32,
-    dns: u32,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -340,6 +382,7 @@ struct TempRule {
 struct DoctorReport {
     engine: &'static str,
     daemon: &'static str,
+    program: Option<String>,
     cgroup: bool,
     bpf_filesystem: bool,
     android_arm64: bool,
@@ -357,6 +400,17 @@ struct ExportRules {
 #[derive(Serialize)]
 struct StatusResponse {
     status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    program: Option<&'static str>,
+}
+
+impl StatusResponse {
+    fn ok() -> Self {
+        Self {
+            status: "ok".to_string(),
+            program: None,
+        }
+    }
 }
 
 enum NotifyResult {
@@ -372,7 +426,9 @@ struct AppState {
     config_dir: PathBuf,
     program_mode: FirewallProgramMode,
     iface_indexes: Mutex<HashMap<String, u32>>,
-    log_tx: tokio::sync::broadcast::Sender<fire_su_common::ConnectionLog>,
+    // `pm list packages` takes seconds per user, so only rerun it when the
+    // package database changes.
+    apps: Mutex<(String, Vec<AppInfo>)>,
 }
 
 type SharedState = Arc<AppState>;
@@ -410,7 +466,7 @@ impl FirewallProgramMode {
 
     fn uid_mask(self, bits: RuleBits) -> u32 {
         match self {
-            Self::Advanced | Self::Basic => bits.mask() & (BLOCK_INTERNET | BLOCK_LAN | BLOCK_DNS),
+            Self::Advanced | Self::Basic => bits.mask() & (BLOCK_INTERNET | BLOCK_LAN),
             Self::UidOnly | Self::Minimal => bits.mask(),
         }
     }
@@ -437,8 +493,8 @@ async fn main() -> anyhow::Result<()> {
         CliCommand::Apply => apply_runtime(&opt).await?,
         CliCommand::Disable => disable_runtime(&opt)?,
         CliCommand::Status => status_runtime(&opt)?,
-        CliCommand::Stats => print_daemon_json(&opt.bind_addr, "/api/stats")?,
-        CliCommand::Logs => print_daemon_json(&opt.bind_addr, "/api/logs")?,
+        CliCommand::Stats => print!("{}", daemon_request(&opt.socket(), "GET", "/api/stats")?),
+        CliCommand::Logs => print!("{}", daemon_request(&opt.socket(), "GET", "/api/logs")?),
         CliCommand::Debug => print_debug_report(&opt)?,
         CliCommand::Doctor => print!("{}", serde_json::to_string(&doctor_report(&opt))?),
         CliCommand::ProfileList => list_profiles(&opt.config_dir)?,
@@ -500,6 +556,10 @@ async fn main() -> anyhow::Result<()> {
             set_rule(&opt.config_dir, &target, &scope, parse_enabled(&value)?)?;
             println!("Staged {target} {scope}={}", parse_enabled(&value)?);
         }
+        CliCommand::StageRules => {
+            let count = stage_rules(&opt.config_dir, std::io::stdin().lock())?;
+            println!("Staged {count} rules");
+        }
         CliCommand::Block { targets } => {
             if targets.is_empty() {
                 bail!("missing package");
@@ -515,8 +575,8 @@ async fn main() -> anyhow::Result<()> {
             }
             if targets[0] == "all" {
                 ensure_store(&opt.config_dir)?;
-                fs::write(rules_file(&opt.config_dir), "")?;
-                fs::write(temp_rules_file(&opt.config_dir), "")?;
+                write_atomic(&rules_file(&opt.config_dir), "")?;
+                write_atomic(&temp_rules_file(&opt.config_dir), "")?;
                 apply_runtime(&opt).await?;
                 println!("Removed all fire-su rules");
             } else {
@@ -534,6 +594,10 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_daemon(opt: Opt) -> anyhow::Result<()> {
     ensure_store(&opt.config_dir)?;
+    // Claim the socket before touching the kernel. A second daemon would
+    // otherwise attach another copy of the program and only then fail.
+    let socket = opt.socket();
+    let listener = bind_control_socket(&socket)?;
     raise_memlock();
     let cgroup_path = resolve_cgroup_path(&opt.cgroup_path);
     eprintln!("--- fire-su daemon start {} ---", unix_now());
@@ -546,9 +610,9 @@ async fn run_daemon(opt: Opt) -> anyhow::Result<()> {
         kernel_version()
     );
     eprintln!(
-        "fire-su: config_dir={} bind_addr={}",
+        "fire-su: config_dir={} socket={}",
         opt.config_dir.display(),
-        opt.bind_addr
+        socket.display()
     );
     eprintln!(
         "fire-su: requested_cgroup_path={} resolved_cgroup_path={} exists={}",
@@ -570,7 +634,7 @@ async fn run_daemon(opt: Opt) -> anyhow::Result<()> {
     )))?;
     eprintln!("fire-su: eBPF object loaded");
     if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
-        warn!("failed to initialize eBPF logger: {e}");
+        debug!("failed to initialize eBPF logger: {e}");
     }
 
     let block_list: BpfHashMap<_, u64, u32> = BpfHashMap::try_from(
@@ -592,8 +656,6 @@ async fn run_daemon(opt: Opt) -> anyhow::Result<()> {
         program_mode.program_name()
     );
 
-    let (log_tx, _) = tokio::sync::broadcast::channel(1000);
-
     let state = Arc::new(AppState {
         bpf_map: Mutex::new(block_list),
         stats_map: Mutex::new(stats_map),
@@ -601,7 +663,7 @@ async fn run_daemon(opt: Opt) -> anyhow::Result<()> {
         config_dir: opt.config_dir.clone(),
         program_mode,
         iface_indexes: Mutex::new(HashMap::new()),
-        log_tx,
+        apps: Mutex::new((String::new(), Vec::new())),
     });
 
     fetch_initial_interfaces(&state).await;
@@ -625,18 +687,15 @@ async fn run_daemon(opt: Opt) -> anyhow::Result<()> {
             current_euid()
         )
     })?;
+    let cgroup_fd = cgroup.as_fd().as_raw_fd();
+    detach_stale_programs(cgroup_fd);
     let program_fd = program.fd().context("get fire_su eBPF program fd")?;
+    let program_fd = program_fd.as_fd().as_raw_fd();
     eprintln!(
-        "fire-su: attaching eBPF program_fd={} cgroup_fd={} attach_type=egress",
-        program_fd.as_fd().as_raw_fd(),
-        cgroup.as_fd().as_raw_fd()
+        "fire-su: attaching eBPF program_fd={program_fd} cgroup_fd={cgroup_fd} attach_type=egress"
     );
-    attach_cgroup_skb_legacy(
-        program_fd.as_fd().as_raw_fd(),
-        cgroup.as_fd().as_raw_fd(),
-        CgroupSkbAttachType::Egress,
-    )
-    .context("attach fire_su eBPF program with BPF_PROG_ATTACH")?;
+    attach_cgroup_skb_legacy(program_fd, cgroup_fd, CgroupSkbAttachType::Egress)
+        .context("attach fire_su eBPF program with BPF_PROG_ATTACH")?;
     eprintln!("fire-su: eBPF program attached");
 
     let state_clone = state.clone();
@@ -654,14 +713,13 @@ async fn run_daemon(opt: Opt) -> anyhow::Result<()> {
         .route("/api/reload", post(handle_reload))
         .route("/api/stats", get(handle_stats))
         .route("/api/logs", get(handle_logs))
-        .route("/api/monitor", get(handle_monitor))
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind(&opt.bind_addr).await?;
     write_pid(&opt.config_dir)?;
-    eprintln!("fire-su: API listening on {}", opt.bind_addr);
-    info!("fire-su eBPF daemon listening on {}", opt.bind_addr);
+    eprintln!("fire-su: API listening on {}", socket.display());
+    info!("fire-su eBPF daemon listening on {}", socket.display());
 
     let serve_result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .context("serve fire-su API")
         .map(|_| ());
@@ -671,69 +729,42 @@ async fn run_daemon(opt: Opt) -> anyhow::Result<()> {
         eprintln!("fire-su: API server stopped");
     }
 
-    let _ = detach_cgroup_skb_legacy(
-        program_fd.as_fd().as_raw_fd(),
-        cgroup.as_fd().as_raw_fd(),
-        CgroupSkbAttachType::Egress,
-    );
+    // Legacy attachments outlive the process, so without this the last
+    // rules would stay enforced until reboot.
+    match detach_cgroup_skb_legacy(program_fd, cgroup_fd, CgroupSkbAttachType::Egress) {
+        Ok(()) => eprintln!("fire-su: eBPF program detached"),
+        Err(error) => eprintln!("fire-su: detach failed: {error:#}"),
+    }
 
     let _ = fs::remove_file(pid_file(&opt.config_dir));
+    let _ = fs::remove_file(&socket);
     serve_result
 }
 
-#[derive(Clone, Debug, Serialize)]
-struct ConnectionLogDto {
-    uid: u32,
-    protocol: u8,
-    action: u8,
-    src_ip: String,
-    dst_ip: String,
-    src_port: u16,
-    dst_port: u16,
-    bytes: u32,
-}
-
-impl From<fire_su_common::ConnectionLog> for ConnectionLogDto {
-    fn from(log: fire_su_common::ConnectionLog) -> Self {
-        Self {
-            uid: log.uid,
-            protocol: log.protocol,
-            action: log.action,
-            src_ip: format!(
-                "{}.{}.{}.{}",
-                (log.src_ip[0] >> 24) & 0xff,
-                (log.src_ip[0] >> 16) & 0xff,
-                (log.src_ip[0] >> 8) & 0xff,
-                log.src_ip[0] & 0xff
-            ), // simplistic
-            dst_ip: format!(
-                "{}.{}.{}.{}",
-                (log.dst_ip[0] >> 24) & 0xff,
-                (log.dst_ip[0] >> 16) & 0xff,
-                (log.dst_ip[0] >> 8) & 0xff,
-                log.dst_ip[0] & 0xff
-            ),
-            src_port: log.src_port,
-            dst_port: log.dst_port,
-            bytes: log.bytes,
-        }
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (Ok(mut term), Ok(mut int)) = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    tokio::select! {
+        _ = term.recv() => eprintln!("fire-su: SIGTERM received"),
+        _ = int.recv() => eprintln!("fire-su: SIGINT received"),
     }
 }
 
-async fn handle_monitor(State(state): State<SharedState>) -> axum::response::Response {
-    let mut rx = state.log_tx.subscribe();
-    let stream = async_stream::stream! {
-        while let Ok(log) = rx.recv().await {
-            let dto: ConnectionLogDto = log.into();
-            if let Ok(json) = serde_json::to_string(&dto) {
-                yield Ok::<_, std::convert::Infallible>(format!("{}\n", json));
-            }
-        }
-    };
-    axum::response::Response::builder()
-        .header("Content-Type", "application/json-stream")
-        .body(axum::body::Body::from_stream(stream))
-        .unwrap()
+fn bind_control_socket(path: &Path) -> anyhow::Result<tokio::net::UnixListener> {
+    if UnixStream::connect(path).is_ok() {
+        bail!("fire-su daemon already running on {}", path.display());
+    }
+    let _ = fs::remove_file(path);
+    let listener = tokio::net::UnixListener::bind(path)
+        .with_context(|| format!("bind control socket {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
 }
 
 async fn handle_stats(State(state): State<SharedState>) -> Json<Vec<StatRow>> {
@@ -744,24 +775,21 @@ async fn handle_logs(State(state): State<SharedState>) -> Json<Vec<LogRow>> {
     Json(read_logs(&state).await)
 }
 
-async fn handle_health() -> Json<StatusResponse> {
+async fn handle_health(State(state): State<SharedState>) -> Json<StatusResponse> {
     Json(StatusResponse {
         status: "ok".to_string(),
+        program: Some(state.program_mode.label()),
     })
 }
 
 async fn handle_reload(State(state): State<SharedState>) -> (StatusCode, Json<StatusResponse>) {
     match sync_bpf_map(&state).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(StatusResponse {
-                status: "ok".to_string(),
-            }),
-        ),
+        Ok(()) => (StatusCode::OK, Json(StatusResponse::ok())),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(StatusResponse {
                 status: format!("error: {error}"),
+                program: None,
             }),
         ),
     }
@@ -770,134 +798,103 @@ async fn handle_reload(State(state): State<SharedState>) -> (StatusCode, Json<St
 async fn sync_bpf_map(state: &AppState) -> anyhow::Result<()> {
     let mode = get_default_mode(&state.config_dir)?;
     let rules = effective_rules(&state.config_dir)?;
-    let apps = list_apps();
+    let apps = cached_apps(state).await;
     let iface_indexes = state.iface_indexes.lock().await.clone();
+    let desired = desired_entries(mode, &rules, &apps, state.program_mode, &iface_indexes);
+
+    let mut bpf_map = state.bpf_map.lock().await;
+    let current: HashMap<u64, u32> = bpf_map.iter().filter_map(Result::ok).collect();
+    // Update in place instead of clearing first: a cleared map lets every
+    // blocked app through until the refill finishes.
+    let mut inserted = 0usize;
+    for (key, value) in &desired {
+        if current.get(key) != Some(value) {
+            bpf_map.insert(*key, *value, 0)?;
+            inserted += 1;
+        }
+    }
+    let mut removed = 0usize;
+    for key in current.keys() {
+        if !desired.contains_key(key) {
+            let _ = bpf_map.remove(key);
+            removed += 1;
+        }
+    }
     eprintln!(
-        "fire-su: sync start mode={} program_mode={} configured_rules={} apps={} interfaces={}",
+        "fire-su: sync mode={} program={} rules={} apps={} interfaces={} entries={} +{} -{}",
         mode.as_str(),
         state.program_mode.label(),
         rules.len(),
         apps.len(),
-        iface_indexes.len()
+        iface_indexes.len(),
+        desired.len(),
+        inserted,
+        removed
     );
-
-    let mut bpf_map = state.bpf_map.lock().await;
-    let keys: Vec<u64> = bpf_map
-        .iter()
-        .filter_map(Result::ok)
-        .map(|(key, _)| key)
-        .collect();
-    let removed_keys = keys.len();
-    for key in keys {
-        let _ = bpf_map.remove(&key);
-    }
-
-    let generic_rules: BTreeMap<_, _> = rules
-        .iter()
-        .filter(|(target, _)| !target.contains('@'))
-        .map(|(target, bits)| (target.clone(), *bits))
-        .collect();
-    let mut inserted_entries = 0usize;
-    let mut matched_targets = BTreeSet::new();
-    for app in apps {
-        let target = app.target();
-        let exact_bits = rules.get(&target).copied();
-        let generic_bits = generic_rules.get(&app.package_name).copied();
-        let bits = exact_bits
-            .or(generic_bits)
-            .unwrap_or_else(|| mode.default_rule());
-        if exact_bits.is_some() {
-            matched_targets.insert(target.clone());
-        }
-        if generic_bits.is_some() {
-            matched_targets.insert(app.package_name.clone());
-        }
-        if exact_bits.is_some() || generic_bits.is_some() {
-            eprintln!(
-                "fire-su: sync match target={} package={} uid={} bits={}",
-                target,
-                app.package_name,
-                app.uid,
-                format_rule_bits(bits)
-            );
-        }
-        if !bits.any() {
-            continue;
-        }
-        inserted_entries += insert_uid_rules(
-            &mut bpf_map,
-            state.program_mode,
-            app.uid,
-            bits,
-            &iface_indexes,
-        )?;
-    }
-    for target in rules.keys() {
-        if !matched_targets.contains(target) {
-            eprintln!("fire-su: sync warning unmatched rule target={target}");
-        }
-    }
-
-    eprintln!(
-        "fire-su: sync complete removed_map_entries={} inserted_map_entries={}",
-        removed_keys, inserted_entries
-    );
-    debug!("synchronized eBPF firewall map");
     Ok(())
 }
 
-fn insert_uid_rules(
-    bpf_map: &mut BpfHashMap<aya::maps::MapData, u64, u32>,
+async fn cached_apps(state: &AppState) -> Vec<AppInfo> {
+    let stamp = apps_stamp();
+    let mut cache = state.apps.lock().await;
+    if cache.0 != stamp || cache.1.is_empty() {
+        let apps = tokio::task::spawn_blocking(list_apps)
+            .await
+            .unwrap_or_default();
+        *cache = (stamp, apps);
+    }
+    cache.1.clone()
+}
+
+fn desired_entries(
+    mode: Mode,
+    rules: &BTreeMap<String, RuleBits>,
+    apps: &[AppInfo],
     program_mode: FirewallProgramMode,
-    uid: u32,
-    bits: RuleBits,
     iface_indexes: &HashMap<String, u32>,
-) -> anyhow::Result<usize> {
-    let mut inserted_entries = 0usize;
-    let global_mask = program_mode.uid_mask(bits);
-    if global_mask != 0 {
-        bpf_map.insert(uid as u64, global_mask, 0)?;
-        inserted_entries += 1;
-        eprintln!(
-            "fire-su: map insert uid={} key={} reason_mask={} bits={}",
-            uid,
-            uid,
-            global_mask,
-            format_rule_bits(bits)
-        );
-    }
-
-    if !program_mode.uses_interface_rules() {
-        return Ok(inserted_entries);
-    }
-
-    for (name, ifindex) in iface_indexes {
-        let blocked = (bits.wifi == 1 && is_wifi(name))
-            || (bits.mobile == 1 && is_mobile(name))
-            || (bits.vpn == 1 && is_vpn(name));
-        if blocked {
-            let key = ((*ifindex as u64) << 32) | uid as u64;
-            let reason = if bits.wifi == 1 && is_wifi(name) {
-                BLOCK_WIFI
-            } else if bits.mobile == 1 && is_mobile(name) {
-                BLOCK_MOBILE
-            } else {
-                BLOCK_VPN
+) -> HashMap<u64, u32> {
+    let mut entries = HashMap::new();
+    for app in apps {
+        let target = app.target();
+        let bits = rules
+            .get(&target)
+            .or_else(|| rules.get(&app.package_name))
+            .copied()
+            .unwrap_or_else(|| default_rule_for(mode, app.uid));
+        if !bits.any() {
+            continue;
+        }
+        // Packages can share a UID; blocking wins over allowing.
+        let global = program_mode.uid_mask(bits);
+        if global != 0 {
+            *entries.entry(app.uid as u64).or_insert(0) |= global;
+        }
+        // internet=1 already drops non-LAN traffic on every interface.
+        if !program_mode.uses_interface_rules() || bits.internet == 1 {
+            continue;
+        }
+        for (name, ifindex) in iface_indexes {
+            let reason = match iface_class(name) {
+                "wifi" if bits.wifi == 1 => BLOCK_WIFI,
+                "mobile" if bits.mobile == 1 => BLOCK_MOBILE,
+                "vpn" if bits.vpn == 1 => BLOCK_VPN,
+                _ => continue,
             };
-            bpf_map.insert(key, reason, 0)?;
-            inserted_entries += 1;
-            eprintln!(
-                "fire-su: map insert uid={} ifname={} ifindex={} key={} reason={}",
-                uid,
-                name,
-                ifindex,
-                key,
-                reason_name(reason)
-            );
+            entries.insert(((*ifindex as u64) << 32) | app.uid as u64, reason);
         }
     }
+    entries
+}
 
-    Ok(inserted_entries)
+// Core Android UIDs (below 10000: system, network stack, bluetooth...) are not
+// swept up by whitelist mode. Blocking them breaks connectivity checks and
+// can make Android drop a working Wi-Fi. Explicit rules still apply.
+fn default_rule_for(mode: Mode, uid: u32) -> RuleBits {
+    if mode == Mode::Whitelist && uid % 100_000 < 10_000 {
+        RuleBits::default()
+    } else {
+        mode.default_rule()
+    }
 }
 
 async fn read_stats(state: &AppState) -> Vec<StatRow> {
@@ -923,24 +920,48 @@ async fn read_stats(state: &AppState) -> Vec<StatRow> {
 }
 
 async fn read_logs(state: &AppState) -> Vec<LogRow> {
+    let now = monotonic_ns();
+    let names: HashMap<u32, String> = state
+        .iface_indexes
+        .lock()
+        .await
+        .iter()
+        .map(|(name, index)| (*index, name.clone()))
+        .collect();
     let events_map = state.events_map.lock().await;
-    let mut rows: Vec<_> = events_map
+    let mut events: Vec<_> = events_map
         .iter()
         .filter_map(Result::ok)
-        .map(|(_, event)| LogRow {
+        .map(|(_, event)| event)
+        .filter(|event| event.reason != 0)
+        .collect();
+    events.sort_by_key(|event| std::cmp::Reverse(event.seen));
+    events.truncate(100);
+    events
+        .into_iter()
+        .map(|event| LogRow {
             uid: event.uid,
             ifindex: event.ifindex,
+            iface: names.get(&event.ifindex).cloned().unwrap_or_default(),
             reason: reason_name(event.reason).to_string(),
             bytes: event.bytes,
+            ago: now.saturating_sub(event.seen) / 1_000_000_000,
         })
-        .collect();
-    rows.sort_by(|a, b| b.bytes.cmp(&a.bytes));
-    rows.truncate(100);
-    rows
+        .collect()
+}
+
+fn link_name(attributes: &[LinkAttribute]) -> Option<String> {
+    attributes.iter().find_map(|attr| match attr {
+        LinkAttribute::IfName(name) => Some(name.clone()),
+        _ => None,
+    })
 }
 
 async fn monitor_netlink(state: SharedState) {
-    let Ok((connection, _, mut messages)) = new_connection() else {
+    // A plain connection never joins RTNLGRP_LINK, so no link events arrive.
+    // That left VPN tunnels and mobile interfaces created after boot unfiltered.
+    let Ok((connection, _, mut messages)) = new_multicast_connection(&[MulticastGroup::Link])
+    else {
         eprintln!("fire-su: netlink monitor failed to start");
         warn!("failed to open netlink monitor");
         return;
@@ -948,28 +969,41 @@ async fn monitor_netlink(state: SharedState) {
     tokio::spawn(connection);
 
     while let Some((message, _)) = messages.next().await {
-        if let NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewLink(msg)) = message.payload {
-            let mut name = None;
-            for attr in msg.attributes {
-                if let LinkAttribute::IfName(ifname) = attr {
-                    name = Some(ifname);
-                    break;
+        let change = match message.payload {
+            NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewLink(msg)) => {
+                let Some(name) = link_name(&msg.attributes) else {
+                    continue;
+                };
+                let index = msg.header.index;
+                let mut ifaces = state.iface_indexes.lock().await;
+                if ifaces.get(&name) == Some(&index) {
+                    continue;
                 }
+                ifaces.retain(|_, existing| *existing != index);
+                ifaces.insert(name.clone(), index);
+                format!(
+                    "up ifname={name} ifindex={index} class={}",
+                    iface_class(&name)
+                )
             }
-            if let Some(name) = name {
-                eprintln!(
-                    "fire-su: netlink interface update ifname={} ifindex={}",
-                    name, msg.header.index
-                );
-                state
-                    .iface_indexes
-                    .lock()
-                    .await
-                    .insert(name, msg.header.index);
-                let _ = sync_bpf_map(&state).await;
+            NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelLink(msg)) => {
+                let index = msg.header.index;
+                let mut ifaces = state.iface_indexes.lock().await;
+                let before = ifaces.len();
+                ifaces.retain(|_, existing| *existing != index);
+                if ifaces.len() == before {
+                    continue;
+                }
+                format!("down ifindex={index}")
             }
+            _ => continue,
+        };
+        eprintln!("fire-su: interface {change}");
+        if let Err(error) = sync_bpf_map(&state).await {
+            eprintln!("fire-su: sync after interface change failed: {error:#}");
         }
     }
+    eprintln!("fire-su: netlink monitor stopped");
 }
 
 async fn fetch_initial_interfaces(state: &SharedState) {
@@ -982,20 +1016,7 @@ async fn fetch_initial_interfaces(state: &SharedState) {
 
     let mut links = handle.link().get().execute();
     while let Some(Ok(msg)) = links.next().await {
-        let mut name = None;
-        for attr in msg.attributes {
-            if let LinkAttribute::IfName(ifname) = attr {
-                name = Some(ifname);
-                break;
-            }
-        }
-        if let Some(name) = name {
-            eprintln!(
-                "fire-su: found interface ifname={} ifindex={} class={}",
-                name,
-                msg.header.index,
-                iface_class(&name)
-            );
+        if let Some(name) = link_name(&msg.attributes) {
             state
                 .iface_indexes
                 .lock()
@@ -1010,28 +1031,31 @@ async fn poll_config(state: SharedState) {
     loop {
         time::sleep(Duration::from_secs(2)).await;
         let next = config_stamp(&state.config_dir);
-        if next != last {
-            eprintln!("fire-su: config change detected; reloading BPF map");
-            last = next;
-            if let Err(error) = sync_bpf_map(&state).await {
-                eprintln!("fire-su: config reload failed: {error:#}");
-            }
+        let temp_due = next_temp_expiry(&state.config_dir).is_some_and(|at| at <= unix_now());
+        if next == last && !temp_due {
+            continue;
         }
+        if let Err(error) = sync_bpf_map(&state).await {
+            eprintln!("fire-su: config reload failed: {error:#}");
+        }
+        // Expired temp rules are pruned from the file during the sync.
+        last = config_stamp(&state.config_dir);
     }
 }
 
 async fn apply_runtime(opt: &Opt) -> anyhow::Result<()> {
     ensure_store(&opt.config_dir)?;
     write_reload_stamp(&opt.config_dir)?;
-    match notify_daemon(&opt.bind_addr) {
+    let socket = opt.socket();
+    match notify_daemon(&socket) {
         NotifyResult::Reloaded => {}
         NotifyResult::Failed(error) => bail!("fire-su daemon reload failed: {error}"),
         NotifyResult::Unreachable => {
             start_daemon_background(opt)?;
             let mut last_error = None;
-            for _ in 0..10 {
+            for _ in 0..20 {
                 time::sleep(Duration::from_millis(300)).await;
-                match notify_daemon(&opt.bind_addr) {
+                match notify_daemon(&socket) {
                     NotifyResult::Reloaded => {
                         println!("fire-su eBPF rules applied");
                         return Ok(());
@@ -1059,13 +1083,20 @@ async fn apply_runtime(opt: &Opt) -> anyhow::Result<()> {
 }
 
 fn disable_runtime(opt: &Opt) -> anyhow::Result<()> {
-    if let Ok(pid) = fs::read_to_string(pid_file(&opt.config_dir)) {
-        if let Ok(pid) = pid.trim().parse::<i32>() {
-            if pid_belongs_to_fire_su(pid) {
-                unsafe {
-                    libc::kill(pid, libc::SIGTERM);
-                }
+    let pid = fs::read_to_string(pid_file(&opt.config_dir))
+        .ok()
+        .and_then(|pid| pid.trim().parse::<i32>().ok())
+        .filter(|pid| pid_belongs_to_fire_su(*pid));
+    if let Some(pid) = pid {
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+        // Wait for the detach, callers like uninstall.sh delete the config dir next.
+        for _ in 0..30 {
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                break;
             }
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
     let _ = fs::remove_file(pid_file(&opt.config_dir));
@@ -1077,22 +1108,27 @@ fn status_runtime(opt: &Opt) -> anyhow::Result<()> {
     ensure_store(&opt.config_dir)?;
     println!("engine=ebpf");
     println!("mode={}", get_default_mode(&opt.config_dir)?.as_str());
+    let health = daemon_health(&opt.socket());
     println!(
         "daemon={}",
-        if daemon_reachable(&opt.bind_addr) {
+        if health.is_some() {
             "running"
         } else {
             "stopped"
         }
     );
+    if let Some(program) = health.as_deref().and_then(health_program) {
+        println!("program={program}");
+    }
     Ok(())
 }
 
-fn notify_daemon(bind_addr: &str) -> NotifyResult {
-    let Ok(mut stream) = TcpStream::connect(bind_addr) else {
+fn notify_daemon(socket: &Path) -> NotifyResult {
+    let Ok(mut stream) = UnixStream::connect(socket) else {
         return NotifyResult::Unreachable;
     };
-    if let Err(error) = stream.set_read_timeout(Some(Duration::from_secs(2))) {
+    // A reload after an app install reruns `pm`, which can take a while.
+    if let Err(error) = stream.set_read_timeout(Some(Duration::from_secs(20))) {
         return NotifyResult::Failed(error.to_string());
     }
     if let Err(error) = stream.write_all(http_request("POST", "/api/reload").as_bytes()) {
@@ -1109,27 +1145,16 @@ fn notify_daemon(bind_addr: &str) -> NotifyResult {
     }
 }
 
-fn daemon_reachable(bind_addr: &str) -> bool {
-    let Ok(mut stream) = TcpStream::connect(bind_addr) else {
-        return false;
-    };
-    if stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .is_err()
-    {
-        return false;
-    }
-    if stream
-        .write_all(http_request("GET", "/api/health").as_bytes())
-        .is_err()
-    {
-        return false;
-    }
-    let mut response = String::new();
-    if stream.read_to_string(&mut response).is_err() {
-        return false;
-    }
-    response.starts_with("HTTP/1.1 200")
+fn daemon_health(socket: &Path) -> Option<String> {
+    daemon_request(socket, "GET", "/api/health").ok()
+}
+
+fn health_program(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("program")?
+        .as_str()
+        .map(ToString::to_string)
 }
 
 fn load_firewall_program(ebpf: &mut aya::Ebpf) -> anyhow::Result<FirewallProgramMode> {
@@ -1212,6 +1237,13 @@ fn attach_cgroup_skb_legacy(
             eprintln!(
                 "fire-su: attach with BPF_F_ALLOW_MULTI failed: {first_error}; retrying without attach flags"
             );
+            // Without ALLOW_MULTI the kernel swaps out whatever is attached,
+            // usually netd's traffic accounting program. Leave a trace of it.
+            for (id, name) in attached_programs(cgroup_fd) {
+                eprintln!(
+                    "fire-su: warning: exclusive attach replaces program id={id} name={name}"
+                );
+            }
             bpf_prog_attach_cmd(BPF_PROG_ATTACH, prog_fd, cgroup_fd, attach_type, 0)
                 .with_context(|| {
                     format!(
@@ -1269,15 +1301,99 @@ fn cgroup_skb_attach_type(attach_type: CgroupSkbAttachType) -> u32 {
     }
 }
 
-fn print_daemon_json(bind_addr: &str, path: &str) -> anyhow::Result<()> {
-    print!("{}", daemon_request(bind_addr, "GET", path)?);
-    Ok(())
+#[repr(C)]
+#[derive(Default)]
+struct BpfProgQueryAttr {
+    target_fd: u32,
+    attach_type: u32,
+    query_flags: u32,
+    attach_flags: u32,
+    prog_ids: u64,
+    prog_cnt: u32,
+    _pad: u32,
+}
+
+fn query_cgroup_programs(cgroup_fd: i32) -> anyhow::Result<Vec<u32>> {
+    let mut ids = [0u32; 64];
+    let mut attr = BpfProgQueryAttr {
+        target_fd: cgroup_fd as u32,
+        attach_type: BPF_CGROUP_INET_EGRESS,
+        prog_ids: ids.as_mut_ptr() as u64,
+        prog_cnt: ids.len() as u32,
+        ..Default::default()
+    };
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_PROG_QUERY,
+            &mut attr as *mut BpfProgQueryAttr,
+            std::mem::size_of::<BpfProgQueryAttr>(),
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(ids[..(attr.prog_cnt as usize).min(ids.len())].to_vec())
+}
+
+fn attached_programs(cgroup_fd: i32) -> Vec<(u32, String)> {
+    let Ok(ids) = query_cgroup_programs(cgroup_fd) else {
+        return Vec::new();
+    };
+    loaded_programs()
+        .filter_map(Result::ok)
+        .filter(|info| ids.contains(&info.id()))
+        .map(|info| (info.id(), info.name_as_str().unwrap_or("?").to_string()))
+        .collect()
+}
+
+// A daemon that died without detaching (crash, SIGKILL, old builds that
+// ignored SIGTERM) leaves its program on the cgroup with frozen rules.
+fn detach_stale_programs(cgroup_fd: i32) {
+    let ids = match query_cgroup_programs(cgroup_fd) {
+        Ok(ids) => ids,
+        Err(error) => {
+            eprintln!("fire-su: cannot query attached programs: {error:#}");
+            return;
+        }
+    };
+    for info in loaded_programs().filter_map(Result::ok) {
+        if !ids.contains(&info.id()) {
+            continue;
+        }
+        let name = info.name_as_str().unwrap_or("");
+        if !name.starts_with("fire_su") {
+            eprintln!(
+                "fire-su: cgroup egress also has id={} name={name}",
+                info.id()
+            );
+            continue;
+        }
+        let result = info.fd().map_err(anyhow::Error::from).and_then(|fd| {
+            detach_cgroup_skb_legacy(
+                fd.as_fd().as_raw_fd(),
+                cgroup_fd,
+                CgroupSkbAttachType::Egress,
+            )
+        });
+        match result {
+            Ok(()) => eprintln!(
+                "fire-su: detached stale program id={} name={name}",
+                info.id()
+            ),
+            Err(error) => eprintln!(
+                "fire-su: failed to detach stale program id={}: {error:#}",
+                info.id()
+            ),
+        }
+    }
 }
 
 fn print_debug_report(opt: &Opt) -> anyhow::Result<()> {
     ensure_store(&opt.config_dir)?;
     let cgroup_path = resolve_cgroup_path(&opt.cgroup_path);
-    let daemon_reachable = daemon_reachable(&opt.bind_addr);
+    let socket = opt.socket();
+    let daemon_reachable = daemon_health(&socket).is_some();
     let active_rules = effective_rules(&opt.config_dir)?
         .into_iter()
         .map(|(target, bits)| DebugRule {
@@ -1287,7 +1403,6 @@ fn print_debug_report(opt: &Opt) -> anyhow::Result<()> {
             mobile: bits.mobile,
             vpn: bits.vpn,
             lan: bits.lan,
-            dns: bits.dns,
         })
         .collect();
     let installed_apps = list_apps()
@@ -1304,12 +1419,12 @@ fn print_debug_report(opt: &Opt) -> anyhow::Result<()> {
         })
         .collect();
     let daemon_stats = if daemon_reachable {
-        daemon_request(&opt.bind_addr, "GET", "/api/stats").ok()
+        daemon_request(&socket, "GET", "/api/stats").ok()
     } else {
         None
     };
     let daemon_logs = if daemon_reachable {
-        daemon_request(&opt.bind_addr, "GET", "/api/logs").ok()
+        daemon_request(&socket, "GET", "/api/logs").ok()
     } else {
         None
     };
@@ -1321,7 +1436,7 @@ fn print_debug_report(opt: &Opt) -> anyhow::Result<()> {
         arch: std::env::consts::ARCH.to_string(),
         kernel: kernel_version(),
         config_dir: opt.config_dir.display().to_string(),
-        bind_addr: opt.bind_addr.clone(),
+        socket: socket.display().to_string(),
         cgroup_path: cgroup_path.display().to_string(),
         cgroup_exists: cgroup_path.exists(),
         bpf_filesystem_exists: Path::new("/sys/fs/bpf").exists(),
@@ -1344,14 +1459,15 @@ fn print_debug_report(opt: &Opt) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn daemon_request(bind_addr: &str, method: &str, path: &str) -> anyhow::Result<String> {
-    let mut stream = TcpStream::connect(bind_addr)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+fn daemon_request(socket: &Path, method: &str, path: &str) -> anyhow::Result<String> {
+    let mut stream = UnixStream::connect(socket)
+        .with_context(|| format!("fire-su daemon is not running ({})", socket.display()))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.write_all(http_request(method, path).as_bytes())?;
     let mut response = String::new();
     let _ = stream.read_to_string(&mut response);
     if !response.starts_with("HTTP/1.1 200") {
-        bail!("daemon request failed");
+        bail!("daemon request failed: {}", http_error_summary(&response));
     }
     Ok(response.split("\r\n\r\n").nth(1).unwrap_or("").to_string())
 }
@@ -1372,19 +1488,26 @@ fn start_daemon_background(opt: &Opt) -> anyhow::Result<()> {
         .context("open fire-su daemon log")?;
     let stderr = log.try_clone().context("clone fire-su daemon log")?;
     let _ = writeln!(log, "\n--- fire-su daemon start {} ---", unix_now());
-    Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .arg("--config-dir")
         .arg(&opt.config_dir)
         .arg("--cgroup-path")
         .arg(&cgroup_path)
-        .arg("--bind-addr")
-        .arg(&opt.bind_addr)
+        .arg("--socket")
+        .arg(opt.socket())
         .arg("daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .context("start fire-su eBPF daemon")?;
+        .stderr(Stdio::from(stderr));
+    // Own session, so the daemon survives the WebUI shell that started it.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    command.spawn().context("start fire-su eBPF daemon")?;
     Ok(())
 }
 
@@ -1456,14 +1579,14 @@ fn get_default_mode(config_dir: &Path) -> anyhow::Result<Mode> {
     Ok(Mode::Blacklist)
 }
 
+// Rules are left alone on a mode switch. Pruning them against the new
+// default used to wipe the whole allow-list when going whitelist -> blacklist.
 fn set_default_mode(config_dir: &Path, mode: Mode) -> anyhow::Result<()> {
     ensure_store(config_dir)?;
-    fs::write(
-        settings_file(config_dir),
+    write_atomic(
+        &settings_file(config_dir),
         format!("defaultMode={}\n", mode.as_str()),
-    )?;
-    save_rules(config_dir, read_rules(config_dir)?)?;
-    Ok(())
+    )
 }
 
 fn read_rules(config_dir: &Path) -> anyhow::Result<BTreeMap<String, RuleBits>> {
@@ -1477,43 +1600,29 @@ fn read_rules(config_dir: &Path) -> anyhow::Result<BTreeMap<String, RuleBits>> {
         if parts.len() < 6 || !is_valid_target(parts[0]) {
             continue;
         }
-        rules.insert(
-            parts[0].to_string(),
-            RuleBits {
-                internet: bit(parts[1]),
-                wifi: bit(parts[2]),
-                mobile: bit(parts[3]),
-                vpn: bit(parts[4]),
-                lan: bit(parts[5]),
-                dns: parts
-                    .get(6)
-                    .map(|value| bit(value))
-                    .unwrap_or_else(|| bit(parts[1])),
-            },
-        );
+        rules.insert(parts[0].to_string(), RuleBits::from_columns(&parts[1..]));
     }
     Ok(rules)
 }
 
 fn save_rules(config_dir: &Path, rules: BTreeMap<String, RuleBits>) -> anyhow::Result<()> {
-    let mode = get_default_mode(config_dir)?;
-    let default = mode.default_rule();
     let mut out = String::new();
     for (target, bits) in rules {
-        if bits == default {
-            continue;
-        }
-        if mode == Mode::Blacklist && !bits.any() {
-            continue;
-        }
-        out.push_str(&format!(
-            "{}|{}|{}|{}|{}|{}|{}\n",
-            target, bits.internet, bits.wifi, bits.mobile, bits.vpn, bits.lan, bits.dns
-        ));
+        out.push_str(&format!("{target}|{}\n", bits.columns()));
     }
-    fs::write(rules_file(config_dir), out)?;
+    write_atomic(&rules_file(config_dir), out)?;
     sync_legacy_json(config_dir)?;
     Ok(())
+}
+
+// Blacklist allow-rules carry no information. Whitelist ones are kept even
+// when they match the default, since core UIDs default to allowed there.
+fn store_rule(rules: &mut BTreeMap<String, RuleBits>, mode: Mode, target: &str, bits: RuleBits) {
+    if mode == Mode::Blacklist && !bits.any() {
+        rules.remove(target);
+    } else {
+        rules.insert(target.to_string(), bits);
+    }
 }
 
 fn read_temp_rules(config_dir: &Path) -> anyhow::Result<BTreeMap<String, TempRule>> {
@@ -1539,14 +1648,7 @@ fn read_temp_rules(config_dir: &Path) -> anyhow::Result<BTreeMap<String, TempRul
         rules.insert(
             parts[0].to_string(),
             TempRule {
-                bits: RuleBits {
-                    internet: bit(parts[1]),
-                    wifi: bit(parts[2]),
-                    mobile: bit(parts[3]),
-                    vpn: bit(parts[4]),
-                    lan: bit(parts[5]),
-                    dns: bit(parts[6]),
-                },
+                bits: RuleBits::from_columns(&parts[1..7]),
                 expires_at,
             },
         );
@@ -1561,19 +1663,20 @@ fn save_temp_rules(config_dir: &Path, rules: &BTreeMap<String, TempRule>) -> any
     let mut out = String::new();
     for (target, rule) in rules {
         out.push_str(&format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}\n",
-            target,
-            rule.bits.internet,
-            rule.bits.wifi,
-            rule.bits.mobile,
-            rule.bits.vpn,
-            rule.bits.lan,
-            rule.bits.dns,
+            "{target}|{}|{}\n",
+            rule.bits.columns(),
             rule.expires_at
         ));
     }
-    fs::write(temp_rules_file(config_dir), out)?;
-    Ok(())
+    write_atomic(&temp_rules_file(config_dir), out)
+}
+
+fn next_temp_expiry(config_dir: &Path) -> Option<u64> {
+    fs::read_to_string(temp_rules_file(config_dir))
+        .ok()?
+        .lines()
+        .filter_map(|line| line.rsplit('|').next()?.parse().ok())
+        .min()
 }
 
 fn remove_temp_rule(config_dir: &Path, target: &str) -> anyhow::Result<()> {
@@ -1613,7 +1716,7 @@ fn set_temp_rule(
                 .ok()
                 .and_then(|rules| rules.get(target).copied())
         })
-        .unwrap_or_else(|| mode.default_rule());
+        .unwrap_or_else(|| target_default(mode, target));
     bits.set(scope, value)?;
     rules.insert(
         target.to_string(),
@@ -1629,13 +1732,15 @@ fn list_profiles(config_dir: &Path) -> anyhow::Result<()> {
     ensure_store(config_dir)?;
     let dir = profiles_dir(config_dir);
     fs::create_dir_all(&dir)?;
+    let mut names = BTreeSet::new();
     for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
+        let name = entry?.file_name().to_string_lossy().into_owned();
         if let Some(name) = name.strip_suffix(".rules") {
-            println!("{name}");
+            names.insert(name.to_string());
         }
+    }
+    for name in names {
+        println!("{name}");
     }
     Ok(())
 }
@@ -1662,9 +1767,9 @@ fn apply_profile(config_dir: &Path, name: &str) -> anyhow::Result<()> {
     if !rules.exists() || !settings.exists() {
         bail!("profile not found: {name}");
     }
-    fs::copy(rules, rules_file(config_dir))?;
-    fs::copy(settings, settings_file(config_dir))?;
-    fs::write(temp_rules_file(config_dir), "")?;
+    write_atomic(&rules_file(config_dir), fs::read_to_string(rules)?)?;
+    write_atomic(&settings_file(config_dir), fs::read_to_string(settings)?)?;
+    write_atomic(&temp_rules_file(config_dir), "")?;
     sync_legacy_json(config_dir)?;
     Ok(())
 }
@@ -1690,11 +1795,65 @@ fn set_rule(config_dir: &Path, target: &str, scope: &str, value: u32) -> anyhow:
     let mut bits = rules
         .get(target)
         .copied()
-        .unwrap_or_else(|| mode.default_rule());
+        .unwrap_or_else(|| target_default(mode, target));
     bits.set(scope, value)?;
-    rules.insert(target.to_string(), bits);
+    store_rule(&mut rules, mode, target, bits);
     save_rules(config_dir, rules)?;
     remove_temp_rule(config_dir, target)
+}
+
+// One process and one file write for the whole batch. The WebUI used to run
+// a stage-set per toggle, which took minutes after a bulk template.
+fn stage_rules(config_dir: &Path, input: impl BufRead) -> anyhow::Result<usize> {
+    ensure_store(config_dir)?;
+    let mut staged = Vec::new();
+    for line in input.lines() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<_> = line.split('|').collect();
+        if parts.len() != 5 || !is_valid_target(parts[0]) {
+            bail!("invalid rule line: {line}");
+        }
+        let bits = RuleBits::from_visible(
+            parse_enabled(parts[1])?,
+            parse_enabled(parts[2])?,
+            parse_enabled(parts[3])?,
+            parse_enabled(parts[4])?,
+        );
+        staged.push((parts[0].to_string(), bits));
+    }
+    let mode = get_default_mode(config_dir)?;
+    let mut rules = read_rules(config_dir)?;
+    let mut temp = read_temp_rules(config_dir)?;
+    for (target, bits) in &staged {
+        store_rule(&mut rules, mode, target, *bits);
+        temp.remove(target);
+    }
+    save_rules(config_dir, rules)?;
+    save_temp_rules(config_dir, &temp)?;
+    Ok(staged.len())
+}
+
+fn target_default(mode: Mode, target: &str) -> RuleBits {
+    match target_uid(target) {
+        Some(uid) => default_rule_for(mode, uid),
+        None => mode.default_rule(),
+    }
+}
+
+// packages.list holds the app id; the per-user uid is user * 100000 + app id.
+fn target_uid(target: &str) -> Option<u32> {
+    let user: u32 = target_user(target).unwrap_or("0").parse().ok()?;
+    let package = target_package(target);
+    let list = fs::read_to_string(PACKAGES_LIST).ok()?;
+    let app_id: u32 = list.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next()? == package).then(|| fields.next()?.parse().ok())?
+    })?;
+    Some(user * 100_000 + app_id % 100_000)
 }
 
 fn list_rules(config_dir: &Path) -> anyhow::Result<()> {
@@ -1711,8 +1870,8 @@ fn list_rules(config_dir: &Path) -> anyhow::Result<()> {
             .map(|app| app.uid.to_string())
             .unwrap_or_else(|| "not-installed".to_string());
         println!(
-            "{} uid={} internet={} wifi={} mobile={} vpn={} lan={} dns={}",
-            target, uid, bits.internet, bits.wifi, bits.mobile, bits.vpn, bits.lan, bits.dns
+            "{} uid={} internet={} wifi={} mobile={} vpn={} lan={}",
+            target, uid, bits.internet, bits.wifi, bits.mobile, bits.vpn, bits.lan
         );
     }
     Ok(())
@@ -1734,7 +1893,7 @@ fn export_rules(config_dir: &Path) -> anyhow::Result<()> {
         .map(|(target, bits, temporary_until)| Rule::new(target, bits, temporary_until))
         .collect();
     let export = ExportRules {
-        version: 6,
+        version: 7,
         default_mode: get_default_mode(config_dir)?.as_str().to_string(),
         rules,
     };
@@ -2114,13 +2273,17 @@ fn target_user(target: &str) -> Option<&str> {
 }
 
 fn is_wifi(name: &str) -> bool {
-    name.starts_with("wlan") || name.starts_with("wifi") || name.starts_with("swlan")
+    ["wlan", "wifi", "swlan"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 fn is_mobile(name: &str) -> bool {
-    ["rmnet", "ccmni", "ccemni", "pdp", "wwan", "cellular"]
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
+    [
+        "rmnet", "r_rmnet", "ccmni", "ccemni", "pdp", "wwan", "cellular", "seth_lte", "sipa_eth",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
 }
 
 fn is_vpn(name: &str) -> bool {
@@ -2130,6 +2293,9 @@ fn is_vpn(name: &str) -> bool {
 }
 
 fn iface_class(name: &str) -> &'static str {
+    // 464xlat puts IPv4 on a v4-<uplink> clat interface. Unmatched, it let
+    // IPv4 through on IPv6-only carriers even with mobile data blocked.
+    let name = name.strip_prefix("v4-").unwrap_or(name);
     if is_wifi(name) {
         "wifi"
     } else if is_mobile(name) {
@@ -2152,19 +2318,6 @@ fn format_iface_indexes(ifaces: &HashMap<String, u32>) -> String {
     } else {
         rows.join(",")
     }
-}
-
-fn format_rule_bits(bits: RuleBits) -> String {
-    format!(
-        "internet={} wifi={} mobile={} vpn={} lan={} dns={} mask={}",
-        bits.internet,
-        bits.wifi,
-        bits.mobile,
-        bits.vpn,
-        bits.lan,
-        bits.dns,
-        bits.mask()
-    )
 }
 
 fn current_uid() -> u32 {
@@ -2193,17 +2346,45 @@ fn read_cgroup_mounts() -> Vec<String> {
         .collect()
 }
 
+fn modified(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+// Installs and new users change these, so the app list must be rebuilt.
+fn apps_stamp() -> String {
+    format!(
+        "{:?}:{:?}",
+        modified(Path::new(PACKAGES_LIST)),
+        modified(Path::new(USERS_DIR))
+    )
+}
+
 fn config_stamp(config_dir: &Path) -> String {
-    let rules = fs::metadata(rules_file(config_dir))
-        .and_then(|m| m.modified())
-        .ok();
-    let settings = fs::metadata(settings_file(config_dir))
-        .and_then(|m| m.modified())
-        .ok();
-    let temp = fs::metadata(temp_rules_file(config_dir))
-        .and_then(|m| m.modified())
-        .ok();
-    format!("{rules:?}:{settings:?}:{temp:?}:{}", unix_now() / 30)
+    format!(
+        "{:?}:{:?}:{:?}:{}",
+        modified(&rules_file(config_dir)),
+        modified(&settings_file(config_dir)),
+        modified(&temp_rules_file(config_dir)),
+        apps_stamp()
+    )
+}
+
+// The daemon polls these files; a plain write can be caught half done and
+// read as "no rules", which unblocks everything until the next poll.
+fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> anyhow::Result<()> {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, contents)?;
+    fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))?;
+    Ok(())
+}
+
+fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
 fn write_reload_stamp(config_dir: &Path) -> anyhow::Result<()> {
@@ -2268,13 +2449,14 @@ fn reason_name(reason: u32) -> &'static str {
         BLOCK_MOBILE => "mobile",
         BLOCK_VPN => "vpn",
         BLOCK_LAN => "lan",
-        BLOCK_DNS => "dns",
         _ => "blocked",
     }
 }
 
 fn doctor_report(opt: &Opt) -> DoctorReport {
-    let daemon_running = daemon_reachable(&opt.bind_addr);
+    let health = daemon_health(&opt.socket());
+    let daemon_running = health.is_some();
+    let program = health.as_deref().and_then(health_program);
     let cgroup_path = resolve_cgroup_path(&opt.cgroup_path);
     let cgroup = cgroup_path.exists();
     let bpf_filesystem = Path::new("/sys/fs/bpf").exists();
@@ -2296,13 +2478,150 @@ fn doctor_report(opt: &Opt) -> DoctorReport {
     if !android_arm64 {
         warnings.push("this packaged binary is intended for Android ARM64".to_string());
     }
+    match program.as_deref() {
+        Some("basic") => warnings.push(
+            "kernel rejected the full program: LAN is not told apart, a LAN block drops all traffic"
+                .to_string(),
+        ),
+        Some(mode @ ("uid-only" | "minimal")) => warnings.push(format!(
+            "kernel only runs the {mode} program: any rule blocks the app on every network"
+        )),
+        _ => {}
+    }
 
     DoctorReport {
         engine: "ebpf",
         daemon: if daemon_running { "running" } else { "stopped" },
+        program,
         cgroup,
         bpf_filesystem,
         android_arm64,
         warnings,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(package: &str, uid: u32) -> AppInfo {
+        AppInfo {
+            package_name: package.to_string(),
+            uid,
+            user: uid / 100_000,
+            user_label: "Owner".to_string(),
+            kind: "user".to_string(),
+        }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fire-su-test-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn internet_follows_wan_bits() {
+        assert_eq!(RuleBits::from_visible(1, 1, 1, 0).internet, 1);
+        assert_eq!(RuleBits::from_visible(0, 1, 1, 1).internet, 0);
+        let mut bits = Mode::Whitelist.default_rule();
+        bits.set("wifi", 0).unwrap();
+        assert_eq!(bits.internet, 0);
+        assert!(bits.set("dns", 1).is_err());
+    }
+
+    #[test]
+    fn legacy_columns_migrate() {
+        // CLI "block internet"
+        assert_eq!(
+            RuleBits::from_columns(&["1", "0", "0", "0", "0", "0"]),
+            RuleBits::from_visible(1, 1, 1, 0)
+        );
+        // old whitelist default with every network cleared in the WebUI
+        assert_eq!(
+            RuleBits::from_columns(&["1", "0", "0", "0", "0", "1"]),
+            RuleBits::default()
+        );
+        // old whitelist "Wi-Fi allowed"
+        assert_eq!(
+            RuleBits::from_columns(&["1", "0", "1", "1", "1", "1"]),
+            RuleBits::from_visible(0, 1, 1, 1)
+        );
+    }
+
+    #[test]
+    fn whitelist_spares_core_uids_and_honours_allows() {
+        let ifaces = HashMap::from([("wlan0".to_string(), 30), ("rmnet_data0".to_string(), 40)]);
+        let apps = [
+            app("android", 1000),
+            app("org.a", 10100),
+            app("org.b", 10101),
+        ];
+        let rules = BTreeMap::from([("org.b@0".to_string(), RuleBits::from_visible(0, 1, 0, 0))]);
+        let entries = desired_entries(
+            Mode::Whitelist,
+            &rules,
+            &apps,
+            FirewallProgramMode::Advanced,
+            &ifaces,
+        );
+        assert!(!entries.contains_key(&1000));
+        assert_eq!(entries.get(&10100), Some(&(BLOCK_INTERNET | BLOCK_LAN)));
+        // org.b: Wi-Fi allowed, mobile blocked per interface, nothing global
+        assert!(!entries.contains_key(&10101));
+        assert_eq!(entries.get(&((40u64 << 32) | 10101)), Some(&BLOCK_MOBILE));
+        assert!(!entries.contains_key(&((30u64 << 32) | 10101)));
+    }
+
+    #[test]
+    fn shared_uid_blocking_wins() {
+        let apps = [app("org.a", 10200), app("org.a.helper", 10200)];
+        let rules = BTreeMap::from([("org.a@0".to_string(), RuleBits::from_visible(1, 1, 1, 1))]);
+        let entries = desired_entries(
+            Mode::Blacklist,
+            &rules,
+            &apps,
+            FirewallProgramMode::Advanced,
+            &HashMap::new(),
+        );
+        assert_eq!(entries.get(&10200), Some(&(BLOCK_INTERNET | BLOCK_LAN)));
+    }
+
+    #[test]
+    fn clat_interface_counts_as_mobile() {
+        assert_eq!(iface_class("v4-rmnet_data0"), "mobile");
+        assert_eq!(iface_class("v4-wlan0"), "wifi");
+        assert_eq!(iface_class("tun0"), "vpn");
+        assert_eq!(iface_class("dummy0"), "other");
+    }
+
+    #[test]
+    fn mode_switch_keeps_allow_list() {
+        let dir = temp_dir("mode");
+        set_default_mode(&dir, Mode::Whitelist).unwrap();
+        stage_rules(&dir, "org.a@0|0|0|0|0\norg.b@0|0|1|1|1\n".as_bytes()).unwrap();
+        set_default_mode(&dir, Mode::Blacklist).unwrap();
+        set_default_mode(&dir, Mode::Whitelist).unwrap();
+        let rules = read_rules(&dir).unwrap();
+        assert_eq!(rules.get("org.a@0"), Some(&RuleBits::default()));
+        assert_eq!(
+            rules.get("org.b@0"),
+            Some(&RuleBits::from_visible(0, 1, 1, 1))
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stage_rules_is_all_or_nothing() {
+        let dir = temp_dir("stage");
+        stage_rules(&dir, "org.a@0|1|1|1|1\n".as_bytes()).unwrap();
+        assert!(stage_rules(&dir, "org.b@0|1|0|0|0\nbad target|1|1|1|1\n".as_bytes()).is_err());
+        let rules = read_rules(&dir).unwrap();
+        assert_eq!(rules.len(), 1);
+        // blacklist allow-rules are dropped
+        stage_rules(&dir, "org.a@0|0|0|0|0\n".as_bytes()).unwrap();
+        assert!(read_rules(&dir).unwrap().is_empty());
+        fs::remove_dir_all(dir).unwrap();
     }
 }

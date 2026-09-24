@@ -38,6 +38,10 @@ jobs:
         working-directory: fire-su-v3/backend/fire-su
         run: cargo check -p fire-su
 
+      - name: Run tests
+        working-directory: fire-su-v3/backend/fire-su
+        run: cargo test -p fire-su
+
       - name: Validate module package
         run: |
           ./package-release.sh
