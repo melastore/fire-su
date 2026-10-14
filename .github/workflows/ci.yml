@@ -24,7 +24,10 @@ jobs:
           rustup toolchain install nightly --component rust-src
 
       - name: Install eBPF linker
-        run: cargo install bpf-linker --locked
+        run: |
+          curl -fsSL https://github.com/aya-rs/bpf-linker/releases/latest/download/bpf-linker-x86_64-unknown-linux-musl.tar.zst \
+            | tar --zstd -xf - -C "$HOME/.cargo/bin" bpf-linker
+          bpf-linker --version
 
       - name: Check formatting
         working-directory: fire-su-v3/backend/fire-su

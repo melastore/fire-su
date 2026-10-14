@@ -45,7 +45,10 @@ jobs:
 
       - name: Install eBPF linker
         if: ${{ inputs.rebuild_android_binary }}
-        run: cargo install bpf-linker --locked
+        run: |
+          curl -fsSL https://github.com/aya-rs/bpf-linker/releases/latest/download/bpf-linker-x86_64-unknown-linux-musl.tar.zst \
+            | tar --zstd -xf - -C "$HOME/.cargo/bin" bpf-linker
+          bpf-linker --version
 
       - name: Build Android binary
         if: ${{ inputs.rebuild_android_binary }}
