@@ -630,14 +630,17 @@ async fn run_daemon(opt: Opt) -> anyhow::Result<()> {
         eprintln!("fire-su: cgroup mount: {mount}");
     }
 
-    let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
-        env!("OUT_DIR"),
-        "/fire-su"
-    )))?;
-    eprintln!("fire-su: eBPF object loaded");
-    if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
-        debug!("failed to initialize eBPF logger: {e}");
-    }
+    let object = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/fire-su"));
+    let (mut ebpf, program_mode) = match load_object(object) {
+        Ok(loaded) => loaded,
+        // Kernels before 5.0 accept BTF_LOAD but not prog_btf_fd, so every
+        // program fails with E2BIG. The programs don't need BTF; retry without.
+        Err(error) => {
+            eprintln!("fire-su: {error:#}; retrying without BTF");
+            let stripped = without_btf(object);
+            load_object(stripped.bytes()).with_context(|| format!("with BTF: {error:#}"))?
+        }
+    };
 
     let block_list: BpfHashMap<_, u64, u32> = BpfHashMap::try_from(
         ebpf.take_map("BLOCK_LIST")
@@ -651,7 +654,6 @@ async fn run_daemon(opt: Opt) -> anyhow::Result<()> {
         ebpf.take_map("BLOCK_EVENTS")
             .context("BLOCK_EVENTS map missing")?,
     )?;
-    let program_mode = load_firewall_program(&mut ebpf)?;
     eprintln!(
         "fire-su: eBPF program loaded mode={} program={}",
         program_mode.label(),
@@ -1059,7 +1061,7 @@ async fn poll_config(state: SharedState) {
         time::sleep(Duration::from_secs(2)).await;
         let next = config_stamp(&state.config_dir);
         let unchanged = *state.synced_stamp.lock().unwrap() == next;
-        if unchanged && !next_temp_expiry(&state.config_dir).is_some_and(|at| at <= unix_now()) {
+        if unchanged && next_temp_expiry(&state.config_dir).is_none_or(|at| at > unix_now()) {
             continue;
         }
         if let Err(error) = sync_bpf_map(&state).await {
@@ -1180,6 +1182,60 @@ fn health_program(body: &str) -> Option<String> {
         .get("program")?
         .as_str()
         .map(ToString::to_string)
+}
+
+fn load_object(object: &[u8]) -> anyhow::Result<(aya::Ebpf, FirewallProgramMode)> {
+    let mut ebpf = aya::Ebpf::load(object)?;
+    eprintln!("fire-su: eBPF object loaded");
+    if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
+        debug!("failed to initialize eBPF logger: {e}");
+    }
+    let mode = load_firewall_program(&mut ebpf)?;
+    Ok((ebpf, mode))
+}
+
+// u64 backing keeps the copy 8-byte aligned, which the ELF parser needs.
+struct AlignedBytes(Vec<u64>, usize);
+
+impl AlignedBytes {
+    fn bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.0.as_ptr().cast(), self.1) }
+    }
+}
+
+// Renames .BTF/.BTF.ext in the section name table so aya treats the object
+// as having no BTF. Maps live in the legacy `maps` section, so nothing breaks.
+fn without_btf(object: &[u8]) -> AlignedBytes {
+    let mut words = vec![0u64; object.len().div_ceil(8)];
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), object.len()) };
+    bytes.copy_from_slice(object);
+    if let Some(range) = shstrtab_range(bytes) {
+        let table = &mut bytes[range];
+        let mut i = 0;
+        while i + 4 <= table.len() {
+            if &table[i..i + 4] == b".BTF" {
+                table[i + 1] = b'x';
+            }
+            i += 1;
+        }
+    }
+    AlignedBytes(words, object.len())
+}
+
+// ELF64 little endian only, which is all bpfel produces.
+fn shstrtab_range(elf: &[u8]) -> Option<std::ops::Range<usize>> {
+    let u16_at =
+        |at: usize| Some(u16::from_le_bytes(elf.get(at..at + 2)?.try_into().ok()?) as usize);
+    let u64_at =
+        |at: usize| Some(u64::from_le_bytes(elf.get(at..at + 8)?.try_into().ok()?) as usize);
+    if elf.get(..6)? != b"\x7fELF\x02\x01" {
+        return None;
+    }
+    let header = u64_at(0x28)? + u16_at(0x3a)? * u16_at(0x3e)?;
+    let start = u64_at(header + 0x18)?;
+    let end = start.checked_add(u64_at(header + 0x20)?)?;
+    (end <= elf.len()).then_some(start..end)
 }
 
 fn load_firewall_program(ebpf: &mut aya::Ebpf) -> anyhow::Result<FirewallProgramMode> {
@@ -2654,6 +2710,17 @@ mod tests {
             &HashMap::new(),
         );
         assert_eq!(entries.get(&10200), Some(&(BLOCK_INTERNET | BLOCK_LAN)));
+    }
+
+    #[test]
+    fn btf_is_hidden_for_old_kernels() {
+        let object = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/fire-su"));
+        let names = |elf: &[u8]| elf[shstrtab_range(elf).unwrap()].to_vec();
+        let has_btf = |table: &[u8]| table.windows(5).any(|w| w == b".BTF\0");
+        assert!(has_btf(&names(object)));
+        let stripped = without_btf(object);
+        assert!(!has_btf(&names(stripped.bytes())));
+        assert!(names(stripped.bytes()).windows(5).any(|w| w == b"maps\0"));
     }
 
     #[test]
