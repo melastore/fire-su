@@ -4,7 +4,7 @@
 use aya_ebpf::{
     helpers::generated::bpf_ktime_get_ns,
     macros::{cgroup_skb, map},
-    maps::HashMap,
+    maps::{HashMap, PerCpuHashMap},
     programs::SkBuffContext,
 };
 
@@ -12,6 +12,9 @@ use fire_su_common::{BlockEvent, TrafficStats};
 
 const BLOCK_INTERNET: u32 = 1 << 0;
 const BLOCK_LAN: u32 = 1 << 4;
+// Set on the uid entry when per-interface keys exist, so apps without them
+// cost one lookup per packet instead of two.
+const HAS_IFACE_RULES: u32 = 1 << 31;
 
 const DROP: i32 = 0;
 const ALLOW: i32 = 1;
@@ -25,7 +28,7 @@ const LOOPBACK_IFINDEX: u32 = 1;
 static BLOCK_LIST: HashMap<u64, u32> = HashMap::with_max_entries(16384, 0);
 
 #[map]
-static TRAFFIC_STATS: HashMap<u64, TrafficStats> = HashMap::with_max_entries(32768, 0);
+static TRAFFIC_STATS: PerCpuHashMap<u64, TrafficStats> = PerCpuHashMap::with_max_entries(32768, 0);
 
 #[map]
 static BLOCK_EVENTS: HashMap<u64, BlockEvent> = HashMap::with_max_entries(4096, 0);
@@ -38,8 +41,9 @@ pub fn fire_su(ctx: SkBuffContext) -> i32 {
         return ALLOW;
     }
     let bytes = ctx.skb.len();
-    let mask = uid_mask(uid);
-    let iface = iface_reason(uid, ifindex);
+    let entry = uid_mask(uid);
+    let mask = entry & !HAS_IFACE_RULES;
+    let iface = iface_reason(uid, ifindex, entry);
     if mask == 0 && iface == 0 {
         return verdict(uid, ifindex, 0, bytes);
     }
@@ -66,11 +70,12 @@ pub fn fire_su_basic(ctx: SkBuffContext) -> i32 {
         return ALLOW;
     }
     let bytes = ctx.skb.len();
-    let iface = iface_reason(uid, ifindex);
+    let entry = uid_mask(uid);
+    let iface = iface_reason(uid, ifindex, entry);
     if iface != 0 {
         return verdict(uid, ifindex, iface, bytes);
     }
-    verdict(uid, ifindex, first_bit(uid_mask(uid)), bytes)
+    verdict(uid, ifindex, first_bit(entry & !HAS_IFACE_RULES), bytes)
 }
 
 #[cgroup_skb]
@@ -98,8 +103,8 @@ fn uid_mask(uid: u64) -> u32 {
     unsafe { BLOCK_LIST.get(&uid) }.copied().unwrap_or(0)
 }
 
-fn iface_reason(uid: u64, ifindex: u32) -> u32 {
-    if ifindex == 0 {
+fn iface_reason(uid: u64, ifindex: u32, entry: u32) -> u32 {
+    if ifindex == 0 || entry & HAS_IFACE_RULES == 0 {
         return 0;
     }
     let key = ((ifindex as u64) << 32) | uid;
@@ -147,12 +152,20 @@ fn verdict(uid: u64, ifindex: u32, reason: u32, bytes: u32) -> i32 {
     if !blocked {
         return ALLOW;
     }
+    let seen = unsafe { bpf_ktime_get_ns() };
+    if let Some(event) = BLOCK_EVENTS.get_ptr_mut(&key) {
+        let event = unsafe { &mut *event };
+        event.ifindex = ifindex;
+        event.bytes = bytes;
+        event.seen = seen;
+        return DROP;
+    }
     let event = BlockEvent {
         uid: uid as u32,
         ifindex,
         reason,
         bytes,
-        seen: unsafe { bpf_ktime_get_ns() },
+        seen,
     };
     let _ = BLOCK_EVENTS.insert(&key, &event, 0);
     DROP

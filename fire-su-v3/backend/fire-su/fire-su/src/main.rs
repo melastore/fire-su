@@ -6,7 +6,7 @@ use axum::{
     routing::{get, post},
 };
 use aya::{
-    maps::HashMap as BpfHashMap,
+    maps::{HashMap as BpfHashMap, PerCpuHashMap},
     programs::{CgroupSkb, CgroupSkbAttachType, loaded_programs},
 };
 use clap::{Parser, Subcommand};
@@ -43,6 +43,8 @@ const BLOCK_WIFI: u32 = 1 << 1;
 const BLOCK_MOBILE: u32 = 1 << 2;
 const BLOCK_VPN: u32 = 1 << 3;
 const BLOCK_LAN: u32 = 1 << 4;
+// Mirrors the eBPF side: uid entry marker for "per-interface keys exist".
+const HAS_IFACE_RULES: u32 = 1 << 31;
 const BPF_PROG_ATTACH: libc::c_uint = 8;
 const BPF_PROG_DETACH: libc::c_uint = 9;
 const BPF_PROG_QUERY: libc::c_uint = 16;
@@ -421,7 +423,7 @@ enum NotifyResult {
 
 struct AppState {
     bpf_map: Mutex<BpfHashMap<aya::maps::MapData, u64, u32>>,
-    stats_map: Mutex<BpfHashMap<aya::maps::MapData, u64, TrafficStats>>,
+    stats_map: Mutex<PerCpuHashMap<aya::maps::MapData, u64, TrafficStats>>,
     events_map: Mutex<BpfHashMap<aya::maps::MapData, u64, BlockEvent>>,
     config_dir: PathBuf,
     program_mode: FirewallProgramMode,
@@ -429,6 +431,9 @@ struct AppState {
     // `pm list packages` takes seconds per user, so only rerun it when the
     // package database changes.
     apps: Mutex<(String, Vec<AppInfo>)>,
+    // config_stamp at the last good sync, so the poller skips work an API
+    // reload already did.
+    synced_stamp: std::sync::Mutex<String>,
 }
 
 type SharedState = Arc<AppState>;
@@ -481,14 +486,11 @@ async fn main() -> anyhow::Result<()> {
     match command {
         CliCommand::List => list_rules(&opt.config_dir)?,
         CliCommand::Export => export_rules(&opt.config_dir)?,
-        CliCommand::ListApps => {
-            for app in list_apps() {
-                println!(
-                    "{}|{}|{}|{}|{}",
-                    app.package_name, app.uid, app.user, app.user_label, app.kind
-                );
-            }
-        }
+        // The daemon keeps the list cached, so skip `pm` when it is up.
+        CliCommand::ListApps => match daemon_request(&opt.socket(), "GET", "/api/apps") {
+            Ok(body) if !body.is_empty() => print!("{body}"),
+            _ => print!("{}", format_apps(&list_apps())),
+        },
         CliCommand::AppIcon { package } => print_app_icon(&package)?,
         CliCommand::Apply => apply_runtime(&opt).await?,
         CliCommand::Disable => disable_runtime(&opt)?,
@@ -641,7 +643,7 @@ async fn run_daemon(opt: Opt) -> anyhow::Result<()> {
         ebpf.take_map("BLOCK_LIST")
             .context("BLOCK_LIST map missing")?,
     )?;
-    let stats_map: BpfHashMap<_, u64, TrafficStats> = BpfHashMap::try_from(
+    let stats_map: PerCpuHashMap<_, u64, TrafficStats> = PerCpuHashMap::try_from(
         ebpf.take_map("TRAFFIC_STATS")
             .context("TRAFFIC_STATS map missing")?,
     )?;
@@ -664,6 +666,7 @@ async fn run_daemon(opt: Opt) -> anyhow::Result<()> {
         program_mode,
         iface_indexes: Mutex::new(HashMap::new()),
         apps: Mutex::new((String::new(), Vec::new())),
+        synced_stamp: std::sync::Mutex::new(String::new()),
     });
 
     fetch_initial_interfaces(&state).await;
@@ -713,6 +716,7 @@ async fn run_daemon(opt: Opt) -> anyhow::Result<()> {
         .route("/api/reload", post(handle_reload))
         .route("/api/stats", get(handle_stats))
         .route("/api/logs", get(handle_logs))
+        .route("/api/apps", get(handle_apps))
         .with_state(state);
     write_pid(&opt.config_dir)?;
     eprintln!("fire-su: API listening on {}", socket.display());
@@ -771,6 +775,10 @@ async fn handle_stats(State(state): State<SharedState>) -> Json<Vec<StatRow>> {
     Json(read_stats(&state).await)
 }
 
+async fn handle_apps(State(state): State<SharedState>) -> String {
+    format_apps(&cached_apps(&state).await)
+}
+
 async fn handle_logs(State(state): State<SharedState>) -> Json<Vec<LogRow>> {
     Json(read_logs(&state).await)
 }
@@ -796,13 +804,16 @@ async fn handle_reload(State(state): State<SharedState>) -> (StatusCode, Json<St
 }
 
 async fn sync_bpf_map(state: &AppState) -> anyhow::Result<()> {
+    // Held for the whole sync: two overlapping syncs could otherwise write
+    // an older snapshot over a newer one.
+    let mut bpf_map = state.bpf_map.lock().await;
+    let stamp = config_stamp(&state.config_dir);
     let mode = get_default_mode(&state.config_dir)?;
     let rules = effective_rules(&state.config_dir)?;
     let apps = cached_apps(state).await;
     let iface_indexes = state.iface_indexes.lock().await.clone();
     let desired = desired_entries(mode, &rules, &apps, state.program_mode, &iface_indexes);
 
-    let mut bpf_map = state.bpf_map.lock().await;
     let current: HashMap<u64, u32> = bpf_map.iter().filter_map(Result::ok).collect();
     // Update in place instead of clearing first: a cleared map lets every
     // blocked app through until the refill finishes.
@@ -831,6 +842,9 @@ async fn sync_bpf_map(state: &AppState) -> anyhow::Result<()> {
         inserted,
         removed
     );
+    // Stamped before reading, so an edit landing mid-sync still triggers
+    // another pass.
+    *state.synced_stamp.lock().unwrap() = stamp;
     Ok(())
 }
 
@@ -873,6 +887,7 @@ fn desired_entries(
         if !program_mode.uses_interface_rules() || bits.internet == 1 {
             continue;
         }
+        let mut has_iface = false;
         for (name, ifindex) in iface_indexes {
             let reason = match iface_class(name) {
                 "wifi" if bits.wifi == 1 => BLOCK_WIFI,
@@ -881,6 +896,10 @@ fn desired_entries(
                 _ => continue,
             };
             entries.insert(((*ifindex as u64) << 32) | app.uid as u64, reason);
+            has_iface = true;
+        }
+        if has_iface {
+            *entries.entry(app.uid as u64).or_insert(0) |= HAS_IFACE_RULES;
         }
     }
     entries
@@ -902,13 +921,22 @@ async fn read_stats(state: &AppState) -> Vec<StatRow> {
     let mut rows: Vec<_> = stats_map
         .iter()
         .filter_map(Result::ok)
-        .map(|(key, stats)| StatRow {
-            uid: (key >> 32) as u32,
-            scope: reason_name(key as u32).to_string(),
-            allowed_packets: stats.allowed_packets,
-            blocked_packets: stats.blocked_packets,
-            allowed_bytes: stats.allowed_bytes,
-            blocked_bytes: stats.blocked_bytes,
+        .map(|(key, per_cpu)| {
+            let mut row = StatRow {
+                uid: (key >> 32) as u32,
+                scope: reason_name(key as u32).to_string(),
+                allowed_packets: 0,
+                blocked_packets: 0,
+                allowed_bytes: 0,
+                blocked_bytes: 0,
+            };
+            for stats in per_cpu.iter() {
+                row.allowed_packets += stats.allowed_packets;
+                row.blocked_packets += stats.blocked_packets;
+                row.allowed_bytes += stats.allowed_bytes;
+                row.blocked_bytes += stats.blocked_bytes;
+            }
+            row
         })
         .collect();
     rows.sort_by(|a, b| {
@@ -1027,19 +1055,16 @@ async fn fetch_initial_interfaces(state: &SharedState) {
 }
 
 async fn poll_config(state: SharedState) {
-    let mut last = config_stamp(&state.config_dir);
     loop {
         time::sleep(Duration::from_secs(2)).await;
         let next = config_stamp(&state.config_dir);
-        let temp_due = next_temp_expiry(&state.config_dir).is_some_and(|at| at <= unix_now());
-        if next == last && !temp_due {
+        let unchanged = *state.synced_stamp.lock().unwrap() == next;
+        if unchanged && !next_temp_expiry(&state.config_dir).is_some_and(|at| at <= unix_now()) {
             continue;
         }
         if let Err(error) = sync_bpf_map(&state).await {
             eprintln!("fire-su: config reload failed: {error:#}");
         }
-        // Expired temp rules are pruned from the file during the sync.
-        last = config_stamp(&state.config_dir);
     }
 }
 
@@ -1462,7 +1487,7 @@ fn print_debug_report(opt: &Opt) -> anyhow::Result<()> {
 fn daemon_request(socket: &Path, method: &str, path: &str) -> anyhow::Result<String> {
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("fire-su daemon is not running ({})", socket.display()))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(20)))?;
     stream.write_all(http_request(method, path).as_bytes())?;
     let mut response = String::new();
     let _ = stream.read_to_string(&mut response);
@@ -1917,27 +1942,42 @@ fn sync_legacy_json(config_dir: &Path) -> anyhow::Result<()> {
 
 fn list_apps() -> Vec<AppInfo> {
     let mut apps = BTreeMap::new();
-    let users = list_user_ids();
-    for user in users {
+    // Each `pm` call boots app_process and takes ~1s; run them all at once.
+    let jobs: Vec<_> = list_user_ids()
+        .into_iter()
+        .flat_map(|user| [(user, "-3", "user"), (user, "-s", "system")])
+        .collect();
+    let outputs: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = jobs
+            .iter()
+            .map(|&(user, flag, _)| {
+                scope.spawn(move || {
+                    command_output(
+                        "pm",
+                        &["list", "packages", flag, "-U", "--user", &user.to_string()],
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or_default())
+            .collect()
+    });
+    for (&(user, _, kind), output) in jobs.iter().zip(outputs) {
         let label = user_label(user);
-        for (flag, kind) in [("-3", "user"), ("-s", "system")] {
-            let output = command_output(
-                "pm",
-                &["list", "packages", flag, "-U", "--user", &user.to_string()],
-            );
-            for line in output.lines() {
-                if let Some((package_name, uid)) = parse_pm_package(line) {
-                    apps.insert(
-                        format!("{package_name}@{user}"),
-                        AppInfo {
-                            package_name,
-                            uid,
-                            user,
-                            user_label: label.clone(),
-                            kind: kind.to_string(),
-                        },
-                    );
-                }
+        for line in output.lines() {
+            if let Some((package_name, uid)) = parse_pm_package(line) {
+                apps.insert(
+                    format!("{package_name}@{user}"),
+                    AppInfo {
+                        package_name,
+                        uid,
+                        user,
+                        user_label: label.clone(),
+                        kind: kind.to_string(),
+                    },
+                );
             }
         }
     }
@@ -1965,6 +2005,17 @@ fn list_apps() -> Vec<AppInfo> {
     }
 
     apps.into_values().collect()
+}
+
+fn format_apps(apps: &[AppInfo]) -> String {
+    apps.iter()
+        .map(|app| {
+            format!(
+                "{}|{}|{}|{}|{}\n",
+                app.package_name, app.uid, app.user, app.user_label, app.kind
+            )
+        })
+        .collect()
 }
 
 fn print_app_icon(package: &str) -> anyhow::Result<()> {
@@ -2178,12 +2229,29 @@ fn base64_encode(bytes: &[u8]) -> String {
 }
 
 fn list_user_ids() -> Vec<u32> {
+    // Every user has /data/system/users/<id>.xml; reading it avoids two slow
+    // binder round trips through `cmd` and `pm`.
+    let mut users: BTreeSet<u32> = fs::read_dir(USERS_DIR)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .ok()?
+                .file_name()
+                .to_str()?
+                .strip_suffix(".xml")?
+                .parse()
+                .ok()
+        })
+        .collect();
+    if !users.is_empty() {
+        return users.into_iter().collect();
+    }
     let output = format!(
         "{}\n{}",
         command_output("cmd", &["user", "list"]),
         command_output("pm", &["list", "users"])
     );
-    let mut users = BTreeSet::new();
     for line in output.lines() {
         if let Some(start) = line.find("UserInfo{") {
             let rest = &line[start + "UserInfo{".len()..];
@@ -2569,7 +2637,7 @@ mod tests {
         assert!(!entries.contains_key(&1000));
         assert_eq!(entries.get(&10100), Some(&(BLOCK_INTERNET | BLOCK_LAN)));
         // org.b: Wi-Fi allowed, mobile blocked per interface, nothing global
-        assert!(!entries.contains_key(&10101));
+        assert_eq!(entries.get(&10101), Some(&HAS_IFACE_RULES));
         assert_eq!(entries.get(&((40u64 << 32) | 10101)), Some(&BLOCK_MOBILE));
         assert!(!entries.contains_key(&((30u64 << 32) | 10101)));
     }
