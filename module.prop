@@ -1,6 +1,6 @@
 id=fire-su
 name=fire-su
-version=1.3
-versionCode=55
+version=1.4
+versionCode=56
 author=ML
 description=Rust/eBPF per-app network firewall for user, private, and system profiles.
